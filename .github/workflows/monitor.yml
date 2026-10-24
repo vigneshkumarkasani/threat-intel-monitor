@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: "17 * * * *"   # every hour at minute 17 (UTC); GitHub may run it a few minutes late
   workflow_dispatch:        # adds a "Run workflow" button so you can test it any time
+    inputs:
+      force_digest:
+        description: "Send the daily digest now"
+        type: boolean
+        default: false
 
 permissions:
   contents: write           # lets the job save seen.json back to the repo
@@ -15,13 +20,13 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - name: Get the code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -29,6 +34,8 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+          FORCE_DIGEST: ${{ inputs.force_digest }}
         run: python monitor.py
 
       - name: Save what was seen
@@ -40,5 +47,6 @@ jobs:
             echo "Nothing new to save"
           else
             git commit -m "Update seen items"
+            git pull --rebase --quiet || true
             git push
           fi
