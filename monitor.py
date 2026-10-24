@@ -235,16 +235,14 @@ def check_kev(state, kev_url, run_id):
 # Source 2: news, research, vendor and government feeds
 # ---------------------------------------------------------------------------
 
-def parse_feed(raw):
-    """Yield (title, link, text) from an RSS or Atom feed, using full content when given."""
-    root = ET.fromstring(raw)
+def _items_from_tree(root):
     atom = "{http://www.w3.org/2005/Atom}"
     content_ns = "{http://purl.org/rss/1.0/modules/content/}encoded"
+    items = []
     for item in root.iter("item"):                                   # RSS 2.0
         body = item.findtext(content_ns) or item.findtext("description") or ""
-        yield ((item.findtext("title") or "").strip(),
-               (item.findtext("link") or item.findtext("guid") or "").strip(),
-               body)
+        items.append(((item.findtext("title") or "").strip(),
+                      (item.findtext("link") or item.findtext("guid") or "").strip(), body))
     for entry in root.iter(f"{atom}entry"):                          # Atom
         link = ""
         for link_el in entry.findall(f"{atom}link"):
@@ -252,7 +250,60 @@ def parse_feed(raw):
                 link = link_el.get("href", "").strip()
                 break
         body = entry.findtext(f"{atom}content") or entry.findtext(f"{atom}summary") or ""
-        yield ((entry.findtext(f"{atom}title") or "").strip(), link, body)
+        items.append(((entry.findtext(f"{atom}title") or "").strip(), link, body))
+    return items
+
+
+def _tag_text(block, *tags):
+    """Text of the first of these tags in a chunk of feed text (handles CDATA)."""
+    for tag in tags:
+        m = re.search(rf"<{tag}(?:\s[^>]*)?>(.*?)</{tag}>", block, re.S | re.I)
+        if m:
+            value = m.group(1).strip()
+            cdata = re.fullmatch(r"<!\[CDATA\[(.*)\]\]>", value, re.S)
+            return cdata.group(1) if cdata else html.unescape(value)
+    return ""
+
+
+def _items_by_pattern(text):
+    """Last resort for badly broken feeds: pull items out with simple patterns."""
+    items = []
+    for block in re.findall(r"<item[\s>].*?</item>", text, re.S | re.I):
+        items.append((_tag_text(block, "title").strip(),
+                      _tag_text(block, "link", "guid").strip(),
+                      _tag_text(block, "content:encoded", "description")))
+    for block in re.findall(r"<entry[\s>].*?</entry>", text, re.S | re.I):
+        link = re.search(r'<link[^>]*href="([^"]+)"', block)
+        items.append((_tag_text(block, "title").strip(), link.group(1) if link else "",
+                      _tag_text(block, "content", "summary")))
+    return items
+
+
+def parse_feed(raw):
+    """
+    Return [(title, link, text)] from an RSS or Atom feed, using full content when given.
+    Many real feeds contain small mistakes (a stray "&", control characters), so if the
+    strict reader refuses a feed it is cleaned up, and failing that read item by item.
+    """
+    text = raw.decode("utf-8", errors="replace").lstrip("\ufeff \r\n\t")
+    head = text[:600].lower()
+    if ("<html" in head or "<!doctype html" in head) and "<rss" not in head and "<feed" not in head:
+        raise ValueError("got a web page instead of a feed (the site may be blocking automated readers)")
+    try:
+        return _items_from_tree(ET.fromstring(raw))
+    except ET.ParseError:
+        pass
+    cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", text)
+    cleaned = re.sub(r"&(?!(?:[a-zA-Z][a-zA-Z0-9]*|#[0-9]+|#x[0-9a-fA-F]+);)", "&amp;", cleaned)
+    cleaned = re.sub(r"^<\?xml[^>]*\?>", "", cleaned)  # str input can't carry an encoding declaration
+    try:
+        return _items_from_tree(ET.fromstring(cleaned))
+    except ET.ParseError:
+        pass
+    items = _items_by_pattern(text)
+    if not items:
+        raise ValueError("feed could not be read, even item by item")
+    return items
 
 
 # "No evidence it was exploited in the wild", "not in the KEV catalog" ...
@@ -373,7 +424,7 @@ def check_feeds(state, feeds, run_id):
     for feed in feeds:
         name, url, kind = feed["name"], feed["url"], feed.get("type", "news")
         try:
-            items = list(parse_feed(fetch(url)))
+            items = parse_feed(fetch(url))
         except (urllib.error.URLError, ET.ParseError, TimeoutError, OSError, ValueError) as err:
             log(f"Could not read {name}: {err}")
             continue

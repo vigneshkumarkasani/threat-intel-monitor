@@ -26,7 +26,6 @@
     {"name": "Fortinet PSIRT", "type": "vendor", "url": "https://filestore.fortinet.com/fortiguard/rss/ir.xml"},
     {"name": "Palo Alto Advisories", "type": "vendor", "url": "https://security.paloaltonetworks.com/rss.xml"},
     {"name": "Google Chrome Releases", "type": "vendor", "url": "https://feeds.feedburner.com/GoogleChromeReleases"},
-    {"name": "CISA Advisories", "type": "government", "url": "https://www.cisa.gov/cybersecurity-advisories/all.xml"},
     {"name": "Mastodon #cve", "type": "social", "url": "https://mastodon.social/tags/cve.rss"},
     {"name": "Mastodon #zeroday", "type": "social", "url": "https://mastodon.social/tags/zeroday.rss"},
     {"name": "Mastodon #ransomware", "type": "social", "url": "https://mastodon.social/tags/ransomware.rss"},

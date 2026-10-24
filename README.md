@@ -1,6 +1,6 @@
 # Threat Intel Monitor
 
-An early-warning feed for vulnerability intelligence. Every 5 minutes it checks 31 news, research, vendor, government and social sources, plus the CISA KEV catalog, and sends a Telegram alert within minutes of publication whenever:
+An early-warning feed for vulnerability intelligence. Every 5 minutes it checks 30 news, research, vendor and social sources, plus the CISA KEV catalog, and sends a Telegram alert within minutes of publication whenever:
 
 - a **new CVE** appears in any news, research or vendor source,
 - a CVE is reported **exploited**, or **linked to malware**,
@@ -17,7 +17,6 @@ A daily digest at 9:00 AM IST ranks the last 24 hours by urgency. It runs on Git
 | News | The Hacker News, BleepingComputer, SecurityWeek, Help Net Security, Dark Reading, The Record, Cyber Security News, GBHackers, Infosecurity Magazine |
 | Threat research | Google Threat Intelligence (Mandiant), Unit 42, Rapid7, watchTowr Labs, Cisco Talos, Microsoft Security Blog, Kaspersky Securelist, Check Point Research, Huntress, SANS ISC, AWS Security Blog, Sophos |
 | Vendor advisories | Cisco, Fortinet PSIRT, Palo Alto Networks, Google Chrome Releases |
-| Government | CISA Cybersecurity Advisories |
 | Social | Mastodon (#cve, #zeroday, #ransomware, #malware, #threatintel); optional Bluesky (free) and X/Twitter (paid) |
 | Enrichment | NVD (CVSS, description), FIRST EPSS (exploit probability) |
 
