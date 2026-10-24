@@ -2,7 +2,7 @@ name: Threat Intel Monitor
 
 on:
   schedule:
-    - cron: "17,47 * * * *"   # every 30 minutes (UTC); GitHub may run it a few minutes late
+    - cron: "*/5 * * * *"  # every 5 minutes (GitHub's minimum); busy times can delay a run
   workflow_dispatch:        # adds a "Run workflow" button so you can test it any time
     inputs:
       force_digest:
@@ -11,7 +11,7 @@ on:
         default: false
 
 permissions:
-  contents: write           # lets the job save seen.json back to the repo
+  contents: write           # lets the job save a daily backup of seen.json to the repo
 
 concurrency:
   group: threat-intel-monitor
@@ -24,6 +24,15 @@ jobs:
     steps:
       - name: Get the code
         uses: actions/checkout@v5
+        with:
+          fetch-depth: 0    # full history, so the backup step can see when it last ran
+
+      - name: Load the bot's memory
+        uses: actions/cache/restore@v4
+        with:
+          path: seen.json
+          key: state-${{ github.run_id }}
+          restore-keys: state-
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -35,18 +44,33 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+          BLUESKY_HANDLE: ${{ secrets.BLUESKY_HANDLE }}
+          BLUESKY_APP_PASSWORD: ${{ secrets.BLUESKY_APP_PASSWORD }}
+          X_BEARER_TOKEN: ${{ secrets.X_BEARER_TOKEN }}
           FORCE_DIGEST: ${{ inputs.force_digest }}
         run: python monitor.py
 
-      - name: Save what was seen
+      - name: Save the bot's memory
+        uses: actions/cache/save@v4
+        with:
+          path: seen.json
+          key: state-${{ github.run_id }}
+
+      - name: Daily backup to the repo
         run: |
+          last=$(git log -1 --format=%ct -- seen.json 2>/dev/null || echo 0)
+          now=$(date +%s)
+          if [ $(( now - ${last:-0} )) -lt 72000 ]; then
+            echo "Backup made in the last 20 hours, skipping"
+            exit 0
+          fi
           git config user.name "threat-intel-monitor[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add seen.json
           if git diff --cached --quiet; then
-            echo "Nothing new to save"
+            echo "Nothing new to back up"
           else
-            git commit -m "Update seen items"
+            git commit -m "Daily backup of seen items"
             git pull --rebase --quiet || true
             git push
           fi
