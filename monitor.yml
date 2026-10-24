@@ -1,0 +1,44 @@
+name: Threat Intel Monitor
+
+on:
+  schedule:
+    - cron: "17 * * * *"   # every hour at minute 17 (UTC); GitHub may run it a few minutes late
+  workflow_dispatch:        # adds a "Run workflow" button so you can test it any time
+
+permissions:
+  contents: write           # lets the job save seen.json back to the repo
+
+concurrency:
+  group: threat-intel-monitor
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run the monitor
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python monitor.py
+
+      - name: Save what was seen
+        run: |
+          git config user.name "threat-intel-monitor[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add seen.json
+          if git diff --cached --quiet; then
+            echo "Nothing new to save"
+          else
+            git commit -m "Update seen items"
+            git push
+          fi
