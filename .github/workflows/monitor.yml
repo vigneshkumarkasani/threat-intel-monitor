@@ -2,7 +2,7 @@ name: Threat Intel Monitor
 
 on:
   schedule:
-    - cron: "*/5 * * * *"  # every 5 minutes (GitHub's minimum); busy times can delay a run
+       - cron: "*/20 * * * *"  # every 20 minutes (backup to cron-job.org); busy times can delay a run
   workflow_dispatch:        # adds a "Run workflow" button so you can test it any time
     inputs:
       force_digest:
