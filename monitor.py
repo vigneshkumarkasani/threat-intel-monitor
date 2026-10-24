@@ -380,6 +380,51 @@ def classify(r):
     return "cve"
 
 
+# Words in an article -> the malware type shown on the threat profile card
+MALWARE_TYPES = {
+    "ransomware": ["ransomware"],
+    "infostealer": ["infostealer", "info-stealer", "stealer", "credential stealer"],
+    "botnet": ["botnet"],
+    "RAT": ["remote access trojan", "rat"],
+    "backdoor": ["backdoor", "backdoors"],
+    "loader": ["loader", "dropper", "downloader"],
+    "trojan": ["trojan", "banking trojan"],
+    "cryptominer": ["cryptominer", "crypto miner", "coinminer", "cryptojacking", "xmrig"],
+    "web shell": ["webshell", "web shell", "webshells", "web shells"],
+    "rootkit / bootkit": ["rootkit", "bootkit"],
+    "spyware": ["spyware", "stalkerware"],
+    "wiper": ["wiper"],
+    "worm": ["worm", "self-propagating"],
+}
+# Words in an article -> how the malware is spread
+DELIVERY_METHODS = {
+    "phishing": ["phishing", "spear-phishing", "spearphishing", "phishing emails", "malicious emails",
+                 "email attachments", "smishing", "vishing"],
+    "ClickFix / fake CAPTCHA": ["clickfix", "fake captcha", "filefix"],
+    "malvertising": ["malvertising", "malicious ads", "malicious advertisements", "sponsored ads"],
+    "SEO poisoning": ["seo poisoning", "search engine poisoning"],
+    "supply chain": ["supply chain", "supply-chain"],
+    "malicious packages": ["npm", "pypi", "malicious packages", "nuget", "rubygems", "crates.io"],
+    "fake / trojanized software": ["fake installer", "fake installers", "trojanized", "cracked software",
+                                   "pirated software", "fake updates", "fake update", "fake browser update"],
+    "malicious extensions": ["browser extension", "browser extensions", "malicious extension",
+                             "malicious extensions", "vs code extension", "vscode extension"],
+    "compromised websites": ["compromised websites", "compromised sites", "watering hole", "drive-by"],
+    "exploited vulnerabilities": ["exploiting vulnerabilities", "exploits known vulnerabilities",
+                                  "exploiting known flaws", "n-day"],
+    "USB / removable media": ["usb drive", "usb drives", "removable media"],
+}
+
+
+def labels_found(text, table):
+    """Which labels from a word table appear in the text (in the table's order)."""
+    found = []
+    for label, words in table.items():
+        if phrase_regex(words).search(text):
+            found.append(label)
+    return found
+
+
 def title_is_malware_news(title):
     """True when a headline is about malware or a named family (used for articles with no CVE)."""
     malware, _, names = sentence_signals(title)
@@ -424,10 +469,13 @@ def record_item(state, source, source_type, title, link, body, run_id):
         })
         added += 1
     if not results and not social and title_is_malware_news(title):
-        _, _, names = sentence_signals(title + ". " + strip_html(body)[:2000])
+        opening = title + ". " + strip_html(body)[:2500]
+        _, _, names = sentence_signals(opening)
         state["findings"].append({
             "cve": None, "kind": "malware_news", "source": source, "source_type": source_type,
             "title": title, "link": link, "malware": sorted(names), "terms": [],
+            "mtypes": labels_found(opening, MALWARE_TYPES),
+            "delivery": labels_found(opening, DELIVERY_METHODS),
             "summary": summary,
             "time": now_utc().isoformat(timespec="seconds"), "run": run_id,
         })
@@ -814,16 +862,16 @@ def render_kev(f, kev, info, epss):
 
 
 def render_malware_news(f):
-    """Full report for a malware article that names no CVE."""
-    lines = ["📰 <b>MALWARE NEWS</b>", DIVIDER, f"<b>{esc(f['title'])}</b>"]
+    """Threat profile card for a malware article that names no CVE."""
+    lines = ["🧬 <b>MALWARE ACTIVITY · NO CVE</b>", DIVIDER, f"<b>{esc(f['title'])}</b>", ""]
+    lines.append(f"🦠 <b>Family:</b> {esc(', '.join(f['malware'])) if f['malware'] else 'not named'}")
+    types = f.get("mtypes") or []
+    lines.append(f"🏷 <b>Type:</b> {esc(', '.join(types)) if types else 'not stated'}")
+    delivery = f.get("delivery") or []
+    lines.append(f"📨 <b>Delivery:</b> {esc(', '.join(delivery)) if delivery else 'not stated'}")
     if f.get("summary"):
         lines += ["", "📝 <b>Summary</b>", f"<blockquote>{esc(f['summary'])}</blockquote>"]
-    lines.append("")
-    if f["malware"]:
-        lines.append(f"🦠 <b>Malware:</b> {esc(', '.join(f['malware']))}")
-    lines.append("🔢 <b>CVEs:</b> none named in the article")
-    lines.append(f"📰 <b>Source:</b> {esc(f['source'])}")
-    lines.append(f"🕒 <b>Found:</b> {found_time(f)}")
+    lines += ["", f"📰 {esc(f['source'])}", f"🕒 {found_time(f)}"]
     buttons = [("📖 Read article", f["link"])] if f["link"].startswith("http") else []
     return {"text": "\n".join(lines), "buttons": buttons}
 
