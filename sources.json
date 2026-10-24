@@ -29,7 +29,6 @@
     {"name": "Oracle Security Alerts", "type": "vendor", "url": "https://www.oracle.com/ocom/groups/public/@otn/documents/webcontent/rss-otn-sec.xml"},
     {"name": "Canadian Centre for Cyber Security", "type": "government", "url": "https://www.cyber.gc.ca/api/cccs/atom/v1/get?feed=alerts_advisories&lang=en"},
     {"name": "CERT-EU", "type": "government", "url": "https://cert.europa.eu/publications/security-advisories-rss"},
-    {"name": "Exploit-DB", "type": "exploit", "url": "https://www.exploit-db.com/rss.xml"},
     {"name": "Mastodon #cve", "type": "social", "url": "https://mastodon.social/tags/cve.rss"},
     {"name": "Mastodon #zeroday", "type": "social", "url": "https://mastodon.social/tags/zeroday.rss"},
     {"name": "Mastodon #ransomware", "type": "social", "url": "https://mastodon.social/tags/ransomware.rss"},
@@ -37,15 +36,9 @@
     {"name": "Mastodon #threatintel", "type": "social", "url": "https://mastodon.social/tags/threatintel.rss"}
   ],
   "github": {
-    "_note": "Uses GitHub's official API with the token GitHub Actions provides automatically.",
-    "poc_queries": [
-      "CVE-2026 in:name",
-      "CVE-2025 in:name"
-    ],
-    "commit_repos": [
-      {"repo": "rapid7/metasploit-framework", "name": "Metasploit"},
-      {"repo": "projectdiscovery/nuclei-templates", "name": "Nuclei templates"}
-    ],
+    "_note": "Uses GitHub's official API with the token GitHub Actions provides automatically. PoC search (poc_queries) and exploit-project commits (commit_repos) are switched off; only the advisory database is read.",
+    "poc_queries": [],
+    "commit_repos": [],
     "advisory_severities": [
       "critical",
       "high"
