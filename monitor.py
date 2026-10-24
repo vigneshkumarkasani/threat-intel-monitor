@@ -9,7 +9,8 @@ for new CVEs and malware, and reports them on Telegram within minutes:
       🦠 a CVE linked to malware or a named malware family
       🛑 / ⚠️ a CVE reported as exploited (by a vendor, or in news/research)
       🆕 the first time a CVE appears in any news, research or vendor source
-      📰 a malware article, even if it names no CVE
+      🧬 a malware article, even if it names no CVE
+      💥 a public exploit, PoC, Metasploit module or Nuclei template for a CVE
     A CVE is alerted again only when its news gets more serious
     (new CVE -> exploited -> malware -> KEV), so one story copied by ten
     sites sends one alert. Social posts alert only on exploitation/malware.
@@ -457,7 +458,7 @@ def record_item(state, source, source_type, title, link, body, run_id):
     summary = make_summary(title, body)
     results = analyse_article(title, body)
     for cve, r in results.items():
-        kind = classify(r)
+        kind = "poc" if source_type == "exploit" else classify(r)
         if social and kind == "cve":
             continue  # social: only exploitation/malware posts (bots announce every CVE)
         state["findings"].append({
@@ -468,7 +469,7 @@ def record_item(state, source, source_type, title, link, body, run_id):
             "time": now_utc().isoformat(timespec="seconds"), "run": run_id,
         })
         added += 1
-    if not results and not social and title_is_malware_news(title):
+    if not results and source_type not in ("social", "exploit") and title_is_malware_news(title):
         opening = title + ". " + strip_html(body)[:2500]
         _, _, names = sentence_signals(opening)
         state["findings"].append({
@@ -620,6 +621,150 @@ def check_x(state, config, run_id):
 
 
 # ---------------------------------------------------------------------------
+# GitHub: PoC repositories, Metasploit modules, Nuclei templates, advisory database
+# (uses the token GitHub Actions provides automatically, through GitHub's official API)
+# ---------------------------------------------------------------------------
+
+def github_api(path, token):
+    headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return json.loads(fetch("https://api.github.com" + path, headers=headers))
+
+
+def check_github(state, config, run_id):
+    settings = config.get("github", {})
+    if not settings:
+        return 0
+    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    added = 0
+
+    def seen_first(source):
+        if source not in state["feeds_read"]:
+            state["feeds_read"].append(source)
+            log(f"{source}: first read, saved items without alerts")
+
+    # 1) Newly created repositories named after a CVE: usually PoCs (sometimes fake ones)
+    since = (now_utc() - timedelta(days=2)).date().isoformat()
+    for query in settings.get("poc_queries", []):
+        q = urllib.parse.quote(f"{query} created:>={since}")
+        try:
+            repos = github_api(f"/search/repositories?q={q}&sort=updated&order=desc&per_page=50",
+                               token).get("items", [])
+        except Exception as err:
+            log(f"GitHub PoC search '{query}' failed: {err}")
+            continue
+        for r in repos:
+            text = f"{r.get('full_name', '')} {r.get('description') or ''}"
+            if len({c.upper() for c in CVE_PATTERN.findall(text)}) > 3:
+                continue  # big collections of many CVEs, not a specific PoC
+            if remember_post(state, r["html_url"], "GitHub PoC"):
+                added += record_item(state, "GitHub PoC repository", "exploit",
+                                     f"{r['full_name']}: {r.get('description') or 'no description'}",
+                                     r["html_url"], r.get("description") or "", run_id)
+    seen_first("GitHub PoC")
+
+    # 2) Recent commits to exploit/detection projects that name a CVE
+    for item in settings.get("commit_repos", []):
+        try:
+            commits = github_api(f"/repos/{item['repo']}/commits?per_page=50", token)
+        except Exception as err:
+            log(f"GitHub {item['name']} commits failed: {err}")
+            continue
+        for c in commits:
+            message = (c.get("commit", {}).get("message") or "").strip()
+            if not CVE_PATTERN.search(message):
+                continue
+            headline = message.splitlines()[0][:200]
+            if remember_post(state, c["html_url"], item["name"]):
+                added += record_item(state, item["name"], "exploit", headline,
+                                     c["html_url"], message[:1500], run_id)
+        seen_first(item["name"])
+
+    # 3) GitHub's reviewed advisory database (open-source packages)
+    for severity in settings.get("advisory_severities", []):
+        try:
+            advisories = github_api(f"/advisories?type=reviewed&severity={severity}"
+                                    "&sort=published&direction=desc&per_page=50", token)
+        except Exception as err:
+            log(f"GitHub advisories ({severity}) failed: {err}")
+            continue
+        for a in advisories:
+            if not a.get("cve_id"):
+                continue
+            body = f"{(a.get('description') or a.get('summary', ''))[:1500]}\n\nCVE: {a['cve_id']}"
+            if remember_post(state, a["html_url"], "GitHub Advisory Database"):
+                added += record_item(state, "GitHub Advisory Database", "vendor",
+                                     a.get("summary", a["cve_id"]), a["html_url"], body, run_id)
+    if settings.get("advisory_severities"):
+        seen_first("GitHub Advisory Database")
+    log(f"GitHub: {added} new CVE matches")
+    return added
+
+
+# ---------------------------------------------------------------------------
+# Dashboard data: a small public feed.json the portfolio page reads
+# ---------------------------------------------------------------------------
+
+def write_dashboard(state, kev, sources_watched):
+    """Last 7 days of findings plus summary numbers, written to feed.json."""
+    week_ago = now_utc() - timedelta(days=7)
+    recent = [f for f in state.get("findings", []) if (parse_time(f.get("time")) or week_ago) >= week_ago]
+    recent.sort(key=lambda f: f.get("time", ""), reverse=True)
+
+    items, seen = [], set()
+    for f in recent:
+        key = (f.get("cve") or f["link"], f["kind"])
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append({
+            "time": f.get("time"), "kind": f["kind"], "cve": f.get("cve"),
+            "title": f.get("title", "")[:200], "link": f.get("link"), "source": f.get("source"),
+            "source_type": f.get("source_type"), "malware": f.get("malware", [])[:5],
+            "cvss": f.get("cvss"), "epss": f.get("epss"),
+            "in_kev": bool(f.get("cve") and f["cve"] in kev),
+            "mtypes": f.get("mtypes", []),
+        })
+
+    by_day = {}
+    for f in recent:
+        day = (parse_time(f["time"]) or now_utc()).astimezone(IST).date().isoformat()
+        by_day[day] = by_day.get(day, 0) + 1
+    days = [(now_utc().astimezone(IST).date() - timedelta(days=d)).isoformat() for d in range(6, -1, -1)]
+
+    def top(counter, n=6):
+        return [{"name": k, "count": v} for k, v in sorted(counter.items(), key=lambda x: -x[1])[:n]]
+
+    malware, sources = {}, {}
+    for f in recent:
+        for name in f.get("malware", []):
+            malware[name] = malware.get(name, 0) + 1
+        sources[f["source"]] = sources.get(f["source"], 0) + 1
+
+    def unique_cves(kind):
+        return len({f["cve"] for f in recent if f["kind"] == kind and f.get("cve")})
+
+    feed = {
+        "generated": now_utc().isoformat(timespec="seconds"),
+        "sources_watched": sources_watched,
+        "totals": {
+            "new_cves": len({f["cve"] for f in recent if f.get("cve")}),
+            "exploited": unique_cves("exploited"),
+            "malware_linked": unique_cves("malware"),
+            "public_exploits": unique_cves("poc"),
+            "kev_added": unique_cves("kev"),
+            "malware_stories": len({f["link"] for f in recent if f["kind"] == "malware_news"}),
+        },
+        "per_day": [{"day": d, "count": by_day.get(d, 0)} for d in days],
+        "top_malware": top(malware),
+        "top_sources": top(sources),
+        "items": items[:150],
+    }
+    (HERE / "feed.json").write_text(json.dumps(feed, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
 # Enrichment: NVD (CVSS, product) and FIRST EPSS
 # ---------------------------------------------------------------------------
 
@@ -719,8 +864,17 @@ def instant_alerts(state, kev, run_id, api_key=""):
         alerted[f"{f['cve']}|kev"] = f["time"]
         best[f["cve"]] = KIND_RANK["kev"]
         planned.append(("kev", [f]))
+    poc_by_link = {}
+    for f in (x for x in fresh if x["kind"] == "poc"):
+        key = f"{f['cve']}|poc"
+        if key in alerted:
+            continue  # one exploit alert per CVE
+        alerted[key] = f["time"]
+        best[f["cve"]] = max(best.get(f["cve"], -1), 0)  # no separate "new CVE" card later
+        poc_by_link.setdefault(f["link"], []).append(f)
+    planned += [("poc", group) for group in poc_by_link.values()]
     by_article = {}
-    for f in (x for x in fresh if x["kind"] != "kev"):
+    for f in (x for x in fresh if x["kind"] not in ("kev", "poc")):
         by_article.setdefault(f["link"], []).append(f)
     for link, group in by_article.items():
         if group[0]["kind"] == "malware_news":
@@ -742,6 +896,11 @@ def instant_alerts(state, kev, run_id, api_key=""):
     info = {}
     for cve in cves[:MAX_ALERT_LOOKUPS]:
         info[cve] = nvd_lookup(state, cve, api_key)
+    for _, group in planned:  # keep the scores with the findings (used by the dashboard)
+        for f in group:
+            if f.get("cve"):
+                f["cvss"] = info.get(f["cve"], {}).get("cvss")
+                f["epss"] = epss.get(f["cve"])
 
     # --- 3) write the messages ------------------------------------------------------
     messages = []
@@ -750,6 +909,8 @@ def instant_alerts(state, kev, run_id, api_key=""):
             messages.append(render_kev(group[0], kev, info, epss))
         elif kind == "malware_news":
             messages.append(render_malware_news(group[0]))
+        elif kind == "poc":
+            messages.append(render_poc(group, kev, info, epss))
         else:
             top = max(KIND_RANK[f["kind"]] for f in group)
             if top == KIND_RANK["cve"]:
@@ -760,7 +921,8 @@ def instant_alerts(state, kev, run_id, api_key=""):
 
 
 def article_buttons(link, cves, kev, source_type="news"):
-    label = "💬 Open post" if source_type == "social" else "📖 Read article"
+    label = {"social": "💬 Open post", "vendor": "📖 Read advisory",
+             "government": "📖 Read advisory"}.get(source_type, "📖 Read article")
     buttons = [(label, link)] if link.startswith("http") else []
     if cves:
         buttons.append(("🔎 NVD", nvd_link(cves[0])))
@@ -800,7 +962,8 @@ def render_detailed(group, top, kev, info, epss):
     if top == KIND_RANK["malware"]:
         label = "🦠 <b>MALWARE LINKED TO CVE</b>"
     elif confirmed:
-        label = "🛑 <b>VENDOR CONFIRMS EXPLOITATION</b>"
+        label = ("🛑 <b>GOVERNMENT ADVISORY: EXPLOITED</b>" if first["source_type"] == "government"
+                 else "🛑 <b>VENDOR CONFIRMS EXPLOITATION</b>")
     else:
         label = "⚠️ <b>EXPLOITATION REPORTED</b>"
     scores = [info.get(c, {}).get("cvss") for c in cves]
@@ -861,6 +1024,34 @@ def render_kev(f, kev, info, epss):
     return {"text": "\n".join(lines), "buttons": buttons}
 
 
+def render_poc(group, kev, info, epss):
+    """Report for a newly published exploit, PoC, Metasploit module or Nuclei template."""
+    first = group[0]
+    cves = sorted({f["cve"] for f in group})
+    scores = [info.get(c, {}).get("cvss") for c in cves]
+    sev = severity_of(max((x for x in scores if x is not None), default=None))
+    label = "💥 <b>PUBLIC EXPLOIT AVAILABLE</b>"
+    if sev:
+        label += f" · {SEVERITY_ICON.get(sev, '')} <b>{sev.upper()}</b>"
+    lines = [label, DIVIDER, f"<b>{esc(first['title'])}</b>"]
+    if first.get("summary") and first["summary"] != first["title"]:
+        lines += ["", "📝 <b>Details</b>", f"<blockquote>{esc(first['summary'])}</blockquote>"]
+    lines += ["", "🔢 <b>CVE details</b>"]
+    for c in cves[:6]:
+        lines.append(f"• <code>{c}</code>  {esc(score_line(c, info.get(c, {}), epss, kev))}")
+        desc = info.get(c, {}).get("description")
+        if desc and len(cves) <= 2:
+            lines.append(f"   <i>{esc(desc if len(desc) <= 180 else desc[:177].rsplit(' ', 1)[0] + '…')}</i>")
+    lines += ["", f"🧰 <b>Exploit source:</b> {esc(first['source'])}"]
+    if first["source"].startswith("GitHub PoC"):
+        lines.append("⚠️ <i>Unverified GitHub repository. Fake PoCs that hide malware are common, "
+                     "so don't run it outside an isolated lab.</i>")
+    lines.append(f"🕒 <b>Found:</b> {found_time(first)}")
+    buttons = [("💥 View exploit", first["link"])] if first["link"].startswith("http") else []
+    buttons.append(("🔎 NVD", nvd_link(cves[0])))
+    return {"text": "\n".join(lines), "buttons": buttons}
+
+
 def render_malware_news(f):
     """Threat profile card for a malware article that names no CVE."""
     lines = ["🧬 <b>MALWARE ACTIVITY · NO CVE</b>", DIVIDER, f"<b>{esc(f['title'])}</b>", ""]
@@ -905,7 +1096,7 @@ def build_digest(state, kev, since, api_key):
 
     def rank(item):
         cve, c = item
-        return (c["in_kev"], c["confirmed"], len(c["sources"]), epss.get(cve, 0))
+        return (c["in_kev"], c["confirmed"], "poc" in c["kinds"], len(c["sources"]), epss.get(cve, 0))
 
     ordered = sorted(by_cve.items(), key=rank, reverse=True)
     for cve, _ in ordered[:MAX_DIGEST_LOOKUPS]:
@@ -922,9 +1113,11 @@ def build_digest(state, kev, since, api_key):
             bits.append(f"EPSS {epss[cve] * 100:.1f}%")
         bits.append("in KEV" if c["in_kev"] else "not in KEV")
         if c["confirmed"] and not c["in_kev"]:
-            bits.append("vendor confirmed")
+            bits.append("officially confirmed")
         if c["ransomware"]:
             bits.append("ransomware use")
+        if "poc" in c["kinds"]:
+            bits.append("public exploit")
         line = f"• {cve_link(cve)}"
         if product:
             line += f" · {esc(product)}"
@@ -947,6 +1140,9 @@ def build_digest(state, kev, since, api_key):
         ("⚠️ Exploitation reported", [x for x in ordered if "exploited" in x[1]["kinds"]
                                       and not (x[1]["kinds"] & {"kev", "malware"})
                                       and not x[1]["malware"]]),
+        ("💥 Public exploits published", [x for x in ordered if "poc" in x[1]["kinds"]
+                                           and not (x[1]["kinds"] & {"kev", "malware", "exploited"})
+                                           and not x[1]["malware"]]),
         ("🆕 Other new CVEs in the news", [x for x in ordered if x[1]["kinds"] == {"cve"}]),
     ]
     sources_count = len({f["source"] for f in recent + news_only})
@@ -1053,6 +1249,7 @@ def main():
     reached = check_feeds(state, config["feeds"], run_id)
     check_bluesky(state, config, run_id)
     check_x(state, config, run_id)
+    check_github(state, config, run_id)
 
     messages = instant_alerts(state, kev, run_id, nvd_key)
     if len(messages) > MAX_INSTANT_ALERTS_PER_RUN:
@@ -1085,6 +1282,15 @@ def main():
             sent += 1
             time.sleep(1)
 
+    sources_watched = (1 + len(config["feeds"]) + len(config.get("github", {}).get("commit_repos", []))
+                       + (1 if config.get("github", {}).get("poc_queries") else 0)
+                       + (1 if config.get("github", {}).get("advisory_severities") else 0)
+                       + (1 if os.environ.get("BLUESKY_HANDLE") else 0)
+                       + (1 if os.environ.get("X_BEARER_TOKEN") else 0))
+    try:
+        write_dashboard(state, kev, sources_watched)
+    except Exception as err:  # the dashboard is a nice-to-have; never let it stop alerts
+        log(f"Dashboard data not written: {err}")
     save_state(state)
     log(f"Done. {reached}/{len(config['feeds'])} feeds read, {len(messages)} messages, {sent} sent.")
 
