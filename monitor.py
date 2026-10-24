@@ -1,20 +1,32 @@
 """
 Threat Intel Monitor
---------------------
-Checks two kinds of sources and sends new findings to Telegram:
+====================
+Watches for actively exploited CVEs and CVEs linked to malware, and reports
+them on Telegram in two ways:
 
-  1. CISA's Known Exploited Vulnerabilities (KEV) catalog -> newly exploited CVEs
-  2. Security news RSS feeds -> articles that name a CVE AND mention malware,
-     ransomware or in-the-wild exploitation
+  * INSTANT ALERTS (every hourly run)
+      - a CVE newly added to CISA's Known Exploited Vulnerabilities (KEV) catalog
+      - an article or vendor advisory that names a CVE together with malware
+        or in-the-wild exploitation, the first time that CVE is seen that way
+  * DAILY DIGEST (once a day, at DIGEST_TIME_IST)
+      - everything from the last 24 hours, grouped by CVE, with CVSS, EPSS,
+        KEV status, named malware and how many sources reported it
 
-It remembers what it has already sent in seen.json, so you never get the
-same alert twice. Uses only Python's standard library: nothing to install.
+Sources live in sources.json and malware names in malware_names.txt, so you
+can add or remove them without touching this code.
+
+What has already been seen is remembered in seen.json, which GitHub Actions
+saves back to the repository after every run.
 
 Settings come from environment variables (GitHub "secrets"):
-  TELEGRAM_BOT_TOKEN   token from @BotFather
-  TELEGRAM_CHAT_ID     your chat ID
-If either is missing, the script runs in DRY-RUN mode and just prints
-the alerts instead of sending them. Handy for testing.
+  TELEGRAM_BOT_TOKEN   token from @BotFather              (required to send)
+  TELEGRAM_CHAT_ID     your chat ID                       (required to send)
+  NVD_API_KEY          free key from NVD, makes lookups faster (optional)
+  FORCE_DIGEST         set to "true" to send the digest right now (optional)
+Without the Telegram settings the script runs in DRY-RUN mode and prints
+the messages instead of sending them.
+
+Uses only Python's standard library: nothing to install.
 """
 
 import html
@@ -27,77 +39,138 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Settings you might want to change
 # ---------------------------------------------------------------------------
 
-KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+DIGEST_TIME_IST = "09:00"        # when the daily digest is sent (India time)
+MAX_INSTANT_ALERTS_PER_RUN = 20  # stops a flood of messages on a busy day
+MAX_DIGEST_LOOKUPS = 40          # most CVEs to look up in NVD per digest
+FINDINGS_KEPT_DAYS = 7           # how long findings are kept for the digest
+ALERT_REPEAT_DAYS = 14           # don't re-alert the same CVE for the same reason
+NEARBY_SENTENCES = 2             # how far from a CVE mention to look for malware words
 
-NEWS_FEEDS = {
-    "The Hacker News": "https://feeds.feedburner.com/TheHackersNews",
-    "BleepingComputer": "https://www.bleepingcomputer.com/feed/",
-    "SecurityWeek": "https://www.securityweek.com/feed/",
-}
-
-# Words that mean "this article is about malware or an attack campaign".
+# Words that mean "this is about malware or an attack campaign".
 MALWARE_WORDS = [
-    "malware", "ransomware", "botnet", "backdoor", "trojan", "stealer",
-    "infostealer", "loader", "dropper", "cryptominer", "crypto miner",
-    "coinminer", "xmrig", "webshell", "web shell", "rootkit", "bootkit",
-    "spyware", "wiper", "rat", "implant", "command-and-control",
+    "malware", "ransomware", "botnet", "backdoor", "backdoors", "trojan",
+    "stealer", "infostealer", "loader", "dropper", "cryptominer", "crypto miner",
+    "coinminer", "cryptojacking", "webshell", "webshells", "web shell",
+    "web shells", "rootkit", "bootkit", "spyware", "wiper", "rat",
+    "implant", "implants", "command-and-control", "c2 server",
 ]
 
-# Words that mean "attackers are already using this bug".
+# Phrases that mean "attackers are already using this bug". Includes the
+# wording vendors use in their own advisories.
 EXPLOIT_WORDS = [
     "actively exploited", "exploited in the wild", "in-the-wild",
-    "in the wild", "zero-day", "0-day", "under attack", "exploitation attempts",
-    "active exploitation", "being exploited", "exploited in attacks",
+    "in the wild", "zero-day", "0-day", "zero day", "under attack",
+    "under active attack", "exploitation attempts", "active exploitation",
+    "being exploited", "exploited in attacks", "exploited as a zero-day",
+    "mass exploitation", "observed exploitation", "exploitation observed",
+    "exists in the wild",                                   # Google Chrome
+    "aware of exploitation", "aware of attempted exploitation",
+    "aware of successful exploitation", "aware of limited exploitation",
+    "aware of active exploitation",                         # Cisco, Palo Alto
+    "reported to be exploited", "has been exploited",       # Fortinet
+    "known exploited", "added to kev", "kev catalog",
 ]
 
-STATE_FILE = Path(__file__).with_name("seen.json")
-MAX_ALERTS_PER_RUN = 25          # stops a flood of messages on a busy day
-MAX_REMEMBERED_ARTICLES = 3000   # keeps seen.json small
+HERE = Path(__file__).parent
+STATE_FILE = HERE / "seen.json"
+SOURCES_FILE = HERE / "sources.json"
+MALWARE_FILE = HERE / "malware_names.txt"
 
+IST = timezone(timedelta(hours=5, minutes=30))
 CVE_PATTERN = re.compile(r"\bCVE-\d{4}-\d{4,7}\b", re.IGNORECASE)
-USER_AGENT = "Mozilla/5.0 (compatible; ThreatIntelMonitor/1.0; +https://github.com)"
+USER_AGENT = "Mozilla/5.0 (compatible; ThreatIntelMonitor/2.0; +https://github.com)"
+CONFIRMED_TYPES = {"vendor", "government"}  # an exploitation claim from these counts as confirmed
 
 
 # ---------------------------------------------------------------------------
 # Small helpers
 # ---------------------------------------------------------------------------
 
+def now_utc():
+    return datetime.now(timezone.utc)
+
+
 def log(message):
-    print(f"[{datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S} UTC] {message}", flush=True)
+    print(f"[{now_utc():%Y-%m-%d %H:%M:%S} UTC] {message}", flush=True)
 
 
-def fetch(url, timeout=30):
+def fetch(url, timeout=30, data=None, headers=None):
     """Download a URL and return the raw bytes."""
-    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    request = urllib.request.Request(url, data=data,
+                                     headers={"User-Agent": USER_AGENT, **(headers or {})})
     with urllib.request.urlopen(request, timeout=timeout) as response:
         return response.read()
 
 
-def word_regex(words):
-    """Build one case-insensitive regex that matches any of the words as whole words."""
-    escaped = sorted((re.escape(w) for w in words), key=len, reverse=True)
-    return re.compile(r"(?<![\w-])(" + "|".join(escaped) + r")(?![\w-])", re.IGNORECASE)
+def phrase_regex(phrases, case_sensitive=False):
+    """One regex that matches any phrase as whole words (longest first)."""
+    escaped = sorted((re.escape(p) for p in phrases if p), key=len, reverse=True)
+    if not escaped:
+        return re.compile(r"(?!x)x")  # matches nothing
+    flags = 0 if case_sensitive else re.IGNORECASE
+    return re.compile(r"(?<![\w-])(" + "|".join(escaped) + r")(?![\w-])", flags)
 
 
-MALWARE_RE = word_regex(MALWARE_WORDS)
-EXPLOIT_RE = word_regex(EXPLOIT_WORDS)
+def load_malware_names():
+    if not MALWARE_FILE.exists():
+        return []
+    names = []
+    for line in MALWARE_FILE.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            names.append(line)
+    return names
+
+
+MALWARE_RE = phrase_regex(MALWARE_WORDS)
+EXPLOIT_RE = phrase_regex(EXPLOIT_WORDS)
+MALWARE_NAMES = load_malware_names()
+MALWARE_NAME_RE = phrase_regex(MALWARE_NAMES)
+CANONICAL_NAME = {n.lower(): n for n in MALWARE_NAMES}
 
 
 def strip_html(text):
-    text = re.sub(r"<[^>]+>", " ", text or "")
-    return re.sub(r"\s+", " ", html.unescape(text)).strip()
+    """HTML to plain text, keeping paragraph breaks as blank lines."""
+    text = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", text or "")
+    text = re.sub(r"(?i)<\s*(br|/?p|/li|/?h\d|/?div|/?ul|/?ol|/?table|/tr|/blockquote)\b[^>]*>", "\n\n", text)
+    text = html.unescape(re.sub(r"<[^>]+>", " ", text))
+    paragraphs = (re.sub(r"\s+", " ", p).strip() for p in re.split(r"\n\s*\n", text))
+    return "\n\n".join(p for p in paragraphs if p)
+
+
+def sentences(paragraph):
+    return [s for s in re.split(r"(?<=[.!?])\s+", paragraph) if s]
+
+
+def esc(text):
+    return html.escape(str(text or ""), quote=False)
 
 
 def nvd_link(cve_id):
     return f"https://nvd.nist.gov/vuln/detail/{cve_id}"
 
+
+def cve_link(cve_id):
+    return f'<a href="{nvd_link(cve_id)}">{cve_id}</a>'
+
+
+def parse_time(value):
+    try:
+        return datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Saved state (seen.json)
+# ---------------------------------------------------------------------------
 
 def load_state():
     if STATE_FILE.exists():
@@ -109,8 +182,15 @@ def load_state():
 
 
 def save_state(state):
-    state["articles"] = state.get("articles", [])[-MAX_REMEMBERED_ARTICLES:]
-    state["last_run"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    cutoff_findings = now_utc() - timedelta(days=FINDINGS_KEPT_DAYS)
+    cutoff_alerts = now_utc() - timedelta(days=ALERT_REPEAT_DAYS)
+    state["articles"] = state.get("articles", [])[-6000:]
+    state["findings"] = [f for f in state.get("findings", [])
+                         if (parse_time(f.get("time")) or now_utc()) > cutoff_findings]
+    state["alerted"] = {k: v for k, v in state.get("alerted", {}).items()
+                        if (parse_time(v) or now_utc()) > cutoff_alerts}
+    state["nvd_cache"] = dict(list(state.get("nvd_cache", {}).items())[-500:])
+    state["last_run"] = now_utc().isoformat(timespec="seconds")
     STATE_FILE.write_text(json.dumps(state, indent=1, sort_keys=True), encoding="utf-8")
 
 
@@ -118,123 +198,377 @@ def save_state(state):
 # Source 1: CISA KEV
 # ---------------------------------------------------------------------------
 
-def check_kev(state):
-    """Return alert messages for KEV entries we haven't seen before."""
-    data = json.loads(fetch(KEV_URL))
+def check_kev(state, kev_url, run_id):
+    """Record new KEV entries as findings. Returns the full KEV lookup table."""
+    data = json.loads(fetch(kev_url, timeout=60))
     entries = data.get("vulnerabilities", [])
     log(f"KEV catalog has {len(entries)} entries")
+    kev = {e["cveID"].upper(): e for e in entries if e.get("cveID")}
 
     first_run = "kev" not in state
     seen = set(state.get("kev", []))
-    new_entries = [e for e in entries if e.get("cveID") not in seen]
-    state["kev"] = sorted(seen | {e.get("cveID") for e in entries if e.get("cveID")})
-
+    state["kev"] = sorted(seen | set(kev))
     if first_run:
-        # Don't send 1,500 messages the first time: just remember everything.
-        log("First run: saved the current KEV list without sending alerts")
-        return []
+        log("KEV: first run, saved the current list without alerting")
+        return kev
 
-    new_entries.sort(key=lambda e: e.get("dateAdded", ""))
-    alerts = []
-    for e in new_entries:
-        cve = e.get("cveID", "")
-        ransomware = e.get("knownRansomwareCampaignUse", "Unknown")
-        lines = [
-            "🔴 <b>New CISA KEV entry</b>",
-            f'<a href="{nvd_link(cve)}">{html.escape(cve)}</a>: '
-            f"{html.escape(e.get('vulnerabilityName', ''))}",
-            f"<b>Product:</b> {html.escape(e.get('vendorProject', ''))} "
-            f"{html.escape(e.get('product', ''))}",
-            f"<b>Added:</b> {html.escape(e.get('dateAdded', ''))} · "
-            f"<b>Federal due date:</b> {html.escape(e.get('dueDate', ''))}",
-        ]
-        if ransomware.lower() == "known":
-            lines.append("🟠 <b>Known ransomware use</b>")
-        if e.get("shortDescription"):
-            lines.append(html.escape(e["shortDescription"][:500]))
-        alerts.append("\n".join(lines))
-    log(f"KEV: {len(alerts)} new entries")
-    return alerts
+    new_ids = sorted((c for c in kev if c not in seen), key=lambda c: kev[c].get("dateAdded", ""))
+    for cve in new_ids:
+        e = kev[cve]
+        state["findings"].append({
+            "cve": cve, "kind": "kev", "source": "CISA KEV", "source_type": "government",
+            "title": e.get("vulnerabilityName", ""),
+            "link": nvd_link(cve), "malware": [], "terms": [],
+            "ransomware": e.get("knownRansomwareCampaignUse", "Unknown").lower() == "known",
+            "time": now_utc().isoformat(timespec="seconds"), "run": run_id,
+        })
+    log(f"KEV: {len(new_ids)} new entries")
+    return kev
 
 
 # ---------------------------------------------------------------------------
-# Source 2: security news RSS feeds
+# Source 2: news, research, vendor and government feeds
 # ---------------------------------------------------------------------------
 
 def parse_feed(raw):
-    """Yield (title, link, summary) from an RSS or Atom feed."""
+    """Yield (title, link, text) from an RSS or Atom feed, using full content when given."""
     root = ET.fromstring(raw)
     atom = "{http://www.w3.org/2005/Atom}"
-    for item in root.iter("item"):                       # RSS 2.0
-        yield (
-            (item.findtext("title") or "").strip(),
-            (item.findtext("link") or "").strip(),
-            item.findtext("description") or "",
-        )
-    for entry in root.iter(f"{atom}entry"):              # Atom
-        link_el = entry.find(f"{atom}link")
-        yield (
-            (entry.findtext(f"{atom}title") or "").strip(),
-            link_el.get("href", "").strip() if link_el is not None else "",
-            entry.findtext(f"{atom}summary") or entry.findtext(f"{atom}content") or "",
-        )
+    content_ns = "{http://purl.org/rss/1.0/modules/content/}encoded"
+    for item in root.iter("item"):                                   # RSS 2.0
+        body = item.findtext(content_ns) or item.findtext("description") or ""
+        yield ((item.findtext("title") or "").strip(),
+               (item.findtext("link") or item.findtext("guid") or "").strip(),
+               body)
+    for entry in root.iter(f"{atom}entry"):                          # Atom
+        link = ""
+        for link_el in entry.findall(f"{atom}link"):
+            if link_el.get("rel", "alternate") == "alternate":
+                link = link_el.get("href", "").strip()
+                break
+        body = entry.findtext(f"{atom}content") or entry.findtext(f"{atom}summary") or ""
+        yield ((entry.findtext(f"{atom}title") or "").strip(), link, body)
 
 
-def check_news(state):
-    """Return alert messages for new articles that tie a CVE to malware or exploitation."""
+# "No evidence it was exploited in the wild", "not in the KEV catalog" ...
+NEGATION_RE = re.compile(
+    r"\bno (known |public |active |confirmed )?(evidence|sign|signs|indication|indications|reports?|"
+    r"exploitation|attacks?|knowledge|information)\b"
+    r"|\bnot (yet |been |currently |known |aware|listed|seen|observed|exploited|included|in (the )?(cisa|kev))"
+    r"|\b(has|have|had|is|are|was|were)n't\b|\b(has|have|is|are|was|were) not\b"
+    r"|\bnever (been )?(exploited|seen|observed)\b|\bunaware\b|\bwithout (any )?evidence\b"
+    r"|\bunexploited\b", re.IGNORECASE)
+# "could let an attacker install malware" describes impact, not a real campaign.
+HYPOTHETICAL_RE = re.compile(
+    r"\b(could|may|might|would|potentially|possible|possibly|can be used|allow(s|ing)? "
+    r"(an )?(attacker|attackers|threat actors?) to|if exploited)\b", re.IGNORECASE)
+
+
+def sentence_signals(sentence):
+    """Return (generic malware words, exploitation phrases, named families) for one sentence."""
+    malware = {m.lower() for m in MALWARE_RE.findall(sentence)}
+    exploit = {m.lower() for m in EXPLOIT_RE.findall(sentence)}
+    names = {CANONICAL_NAME.get(m.lower(), m) for m in MALWARE_NAME_RE.findall(sentence)}
+    if exploit and NEGATION_RE.search(sentence):
+        exploit = set()
+    if malware and (HYPOTHETICAL_RE.search(sentence) or NEGATION_RE.search(sentence)):
+        malware = set()
+    return malware, exploit, names
+
+
+def analyse_article(title, body):
+    """
+    Work out which CVEs an article ties to malware or exploitation.
+
+    Words in the title apply to every CVE in the article. Words in the body
+    only count if they're within NEARBY_SENTENCES of where the CVE is
+    mentioned, so a "related story" about ransomware at the bottom of a page
+    doesn't get pinned to an unrelated CVE.
+    Returns {cve: {"malware": set, "terms": set, "names": set}}.
+    """
+    # (paragraph number, sentence) pairs; nearby words never cross a paragraph break
+    parts = [(n, s) for n, para in enumerate(strip_html(body).split("\n\n")) for s in sentences(para)]
+    t_malware, t_exploit, t_names = sentence_signals(title)
+
+    results = {}
+    for cve in {c.upper() for c in CVE_PATTERN.findall(title)}:
+        results[cve] = {"malware": set(t_malware), "terms": set(t_exploit), "names": set(t_names)}
+
+    signals = [sentence_signals(s) for _, s in parts]
+    for i, (para, sentence) in enumerate(parts):
+        found = {c.upper() for c in CVE_PATTERN.findall(sentence)}
+        if not found:
+            continue
+        window = [signals[j] for j in range(max(0, i - NEARBY_SENTENCES),
+                                            min(len(parts), i + NEARBY_SENTENCES + 1))
+                  if parts[j][0] == para]
+        malware = set().union(*(w[0] for w in window)) | t_malware
+        exploit = set().union(*(w[1] for w in window)) | t_exploit
+        names = set().union(*(w[2] for w in window)) | t_names
+        for cve in found:
+            r = results.setdefault(cve, {"malware": set(), "terms": set(), "names": set()})
+            r["malware"] |= malware
+            r["terms"] |= exploit
+            r["names"] |= names
+
+    # A named malware family counts as a malware link even if no generic word was used.
+    return {c: r for c, r in results.items() if r["malware"] or r["terms"] or r["names"]}
+
+
+def check_feeds(state, feeds, run_id):
     seen = set(state.get("articles", []))
     remembered = list(state.get("articles", []))
     feeds_read = set(state.get("feeds_read", []))
-    alerts = []
+    reached = 0
 
-    for source, url in NEWS_FEEDS.items():
+    for feed in feeds:
+        name, url, kind = feed["name"], feed["url"], feed.get("type", "news")
         try:
             items = list(parse_feed(fetch(url)))
-        except (urllib.error.URLError, ET.ParseError, TimeoutError, OSError) as err:
-            log(f"Could not read {source}: {err}")
+        except (urllib.error.URLError, ET.ParseError, TimeoutError, OSError, ValueError) as err:
+            log(f"Could not read {name}: {err}")
             continue
-        log(f"{source}: {len(items)} articles in feed")
-        # The first time a feed is read, just remember its articles (no backlog flood).
-        first_run = source not in feeds_read
-        if first_run:
-            log(f"{source}: first successful read, saving articles without alerts")
-        feeds_read.add(source)
+        reached += 1
+        first_read = name not in feeds_read
+        feeds_read.add(name)
+        new_matches = 0
 
-        for title, link, summary in items:
+        for title, link, body in items:
             if not link or link in seen:
                 continue
             seen.add(link)
             remembered.append(link)
-
-            text = f"{title} {strip_html(summary)}"
-            cves = sorted({c.upper() for c in CVE_PATTERN.findall(text)})
-            if not cves:
-                continue
-            malware_hits = sorted({m.lower() for m in MALWARE_RE.findall(text)})
-            exploit_hits = sorted({m.lower() for m in EXPLOIT_RE.findall(text)})
-            if not malware_hits and not exploit_hits:
-                continue
-            if first_run:
-                continue  # remember, but don't alert on the backlog
-
-            icon = "🦠" if malware_hits else "⚠️"
-            heading = "Malware linked to CVE" if malware_hits else "Exploitation reported"
-            cve_links = ", ".join(f'<a href="{nvd_link(c)}">{c}</a>' for c in cves[:8])
-            lines = [
-                f"{icon} <b>{heading}</b> · {html.escape(source)}",
-                f'<a href="{html.escape(link, quote=True)}">{html.escape(title)}</a>',
-                f"<b>CVEs:</b> {cve_links}",
-            ]
-            if malware_hits:
-                lines.append(f"<b>Malware terms:</b> {html.escape(', '.join(malware_hits))}")
-            if exploit_hits:
-                lines.append(f"<b>Exploitation terms:</b> {html.escape(', '.join(exploit_hits))}")
-            alerts.append("\n".join(lines))
+            if first_read:
+                continue  # remember the backlog, don't report it
+            for cve, r in analyse_article(title, body).items():
+                state["findings"].append({
+                    "cve": cve,
+                    "kind": "malware" if (r["malware"] or r["names"]) else "exploited",
+                    "source": name, "source_type": kind,
+                    "title": title, "link": link,
+                    "malware": sorted(r["names"]), "terms": sorted(r["malware"] | r["terms"]),
+                    "time": now_utc().isoformat(timespec="seconds"), "run": run_id,
+                })
+                new_matches += 1
+        note = " (first read: saved without alerts)" if first_read else ""
+        log(f"{name}: {len(items)} items, {new_matches} new CVE matches{note}")
 
     state["articles"] = remembered
     state["feeds_read"] = sorted(feeds_read)
-    log(f"News: {len(alerts)} new matching articles")
-    return alerts
+    return reached
+
+
+# ---------------------------------------------------------------------------
+# Enrichment: NVD (CVSS, product) and FIRST EPSS
+# ---------------------------------------------------------------------------
+
+def nvd_lookup(state, cve, api_key):
+    cache = state.setdefault("nvd_cache", {})
+    cached = cache.get(cve)
+    if cached and (now_utc() - (parse_time(cached.get("time")) or now_utc())).days < 3:
+        return cached
+    url = "https://services.nvd.nist.gov/rest/json/cves/2.0?cveId=" + urllib.parse.quote(cve)
+    headers = {"apiKey": api_key} if api_key else {}
+    info = {"time": now_utc().isoformat(timespec="seconds")}
+    try:
+        data = json.loads(fetch(url, timeout=30, headers=headers))
+        vulns = data.get("vulnerabilities", [])
+        if vulns:
+            c = vulns[0]["cve"]
+            metrics = c.get("metrics", {})
+            for key in ("cvssMetricV40", "cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
+                if metrics.get(key):
+                    m = metrics[key][0].get("cvssData", {})
+                    info["cvss"] = m.get("baseScore")
+                    info["severity"] = m.get("baseSeverity") or metrics[key][0].get("baseSeverity")
+                    break
+            desc = next((d["value"] for d in c.get("descriptions", []) if d.get("lang") == "en"), "")
+            info["description"] = desc[:300]
+    except Exception as err:  # NVD is often slow; never let it break the digest
+        log(f"NVD lookup failed for {cve}: {err}")
+        return cached or {}
+    cache[cve] = info
+    time.sleep(0.7 if api_key else 6.5)  # NVD allows 5 requests per 30 s without a key
+    return info
+
+
+def epss_lookup(cves):
+    scores = {}
+    for i in range(0, len(cves), 50):
+        batch = cves[i:i + 50]
+        try:
+            data = json.loads(fetch("https://api.first.org/data/v1/epss?cve=" + ",".join(batch)))
+            for row in data.get("data", []):
+                scores[row["cve"].upper()] = float(row.get("epss", 0))
+        except Exception as err:
+            log(f"EPSS lookup failed: {err}")
+    return scores
+
+
+# ---------------------------------------------------------------------------
+# Building messages
+# ---------------------------------------------------------------------------
+
+def instant_alerts(state, kev, run_id):
+    """Turn this run's new findings into Telegram messages, skipping repeats."""
+    alerted = state.setdefault("alerted", {})
+    fresh = [f for f in state["findings"] if f.get("run") == run_id]
+    messages = []
+
+    # 1) New KEV entries, one message each
+    for f in (x for x in fresh if x["kind"] == "kev"):
+        e = kev.get(f["cve"], {})
+        alerted[f"{f['cve']}|kev"] = f["time"]
+        lines = [
+            "🔴 <b>New CISA KEV entry</b>",
+            f"{cve_link(f['cve'])}: {esc(e.get('vulnerabilityName'))}",
+            f"<b>Product:</b> {esc(e.get('vendorProject'))} {esc(e.get('product'))}",
+            f"<b>Added:</b> {esc(e.get('dateAdded'))} · <b>Federal due date:</b> {esc(e.get('dueDate'))}",
+        ]
+        if f.get("ransomware"):
+            lines.append("🟠 <b>Known ransomware use</b>")
+        if e.get("shortDescription"):
+            lines.append(esc(e["shortDescription"][:400]))
+        messages.append("\n".join(lines))
+
+    # 2) Articles and advisories, one message per article, only for CVEs not alerted recently
+    by_article = {}
+    for f in (x for x in fresh if x["kind"] != "kev"):
+        by_article.setdefault(f["link"], []).append(f)
+    for link, group in by_article.items():
+        new_cves = []
+        for f in group:
+            key = f"{f['cve']}|{f['kind']}"
+            if key not in alerted:
+                new_cves.append(f)
+                alerted[key] = f["time"]
+        if not new_cves:
+            continue
+        first = group[0]
+        is_malware = any(f["kind"] == "malware" for f in new_cves)
+        confirmed = first["source_type"] in CONFIRMED_TYPES
+        if is_malware:
+            heading = "🦠 <b>Malware linked to CVE</b>"
+        elif confirmed:
+            heading = "🛑 <b>Vendor confirms exploitation</b>"
+        else:
+            heading = "⚠️ <b>Exploitation reported</b>"
+        cves = sorted({f["cve"] for f in new_cves})
+        names = sorted({n for f in new_cves for n in f["malware"]})
+        terms = sorted({t for f in new_cves for t in f["terms"]})
+        in_kev = [c for c in cves if c in kev]
+        lines = [
+            f"{heading} · {esc(first['source'])}",
+            f'<a href="{html.escape(link, quote=True)}">{esc(first["title"])}</a>',
+            "<b>CVEs:</b> " + ", ".join(cve_link(c) for c in cves[:10]),
+        ]
+        if names:
+            lines.append(f"<b>Malware:</b> {esc(', '.join(names))}")
+        if terms:
+            lines.append(f"<b>Keywords:</b> {esc(', '.join(terms[:8]))}")
+        lines.append("✅ Already in CISA KEV: " + ", ".join(in_kev) if in_kev
+                     else "⏳ Not in CISA KEV yet")
+        messages.append("\n".join(lines))
+    return messages
+
+
+def build_digest(state, kev, since, api_key):
+    """Group the last day's findings by CVE and write the digest messages."""
+    recent = [f for f in state.get("findings", []) if (parse_time(f["time"]) or since) >= since]
+    if not recent:
+        return [f"📋 <b>Daily threat digest · {now_utc().astimezone(IST):%d %b %Y}</b>\n"
+                "Nothing new in the last 24 hours across all sources."]
+
+    by_cve = {}
+    for f in recent:
+        c = by_cve.setdefault(f["cve"], {"kinds": set(), "sources": {}, "malware": set(),
+                                         "confirmed": False, "ransomware": False})
+        c["kinds"].add(f["kind"])
+        c["sources"].setdefault(f["source"], f["link"])
+        c["malware"] |= set(f.get("malware", []))
+        c["confirmed"] |= f["source_type"] in CONFIRMED_TYPES or f["kind"] == "kev"
+        c["ransomware"] |= bool(f.get("ransomware"))
+
+    for cve, c in by_cve.items():
+        c["in_kev"] = cve in kev
+        if c["in_kev"] and kev[cve].get("knownRansomwareCampaignUse", "").lower() == "known":
+            c["ransomware"] = True
+
+    epss = epss_lookup(sorted(by_cve))
+
+    def rank(item):
+        cve, c = item
+        return (c["in_kev"], c["confirmed"], len(c["sources"]), epss.get(cve, 0))
+
+    ordered = sorted(by_cve.items(), key=rank, reverse=True)
+    for cve, _ in ordered[:MAX_DIGEST_LOOKUPS]:
+        by_cve[cve]["nvd"] = nvd_lookup(state, cve, api_key)
+
+    def describe(cve, c):
+        nvd = c.get("nvd") or {}
+        k = kev.get(cve, {})
+        product = f"{k.get('vendorProject', '')} {k.get('product', '')}".strip()
+        bits = []
+        if nvd.get("cvss") is not None:
+            bits.append(f"CVSS {nvd['cvss']}")
+        if cve in epss:
+            bits.append(f"EPSS {epss[cve] * 100:.1f}%")
+        bits.append("in KEV" if c["in_kev"] else "not in KEV")
+        if c["confirmed"] and not c["in_kev"]:
+            bits.append("vendor confirmed")
+        if c["ransomware"]:
+            bits.append("ransomware use")
+        line = f"• {cve_link(cve)}"
+        if product:
+            line += f" · {esc(product)}"
+        line += f"\n   {esc(' · '.join(bits))}"
+        if c["malware"]:
+            line += f"\n   🦠 {esc(', '.join(sorted(c['malware'])))}"
+        sources = list(c["sources"].items())
+        refs = ", ".join(f'<a href="{html.escape(u, quote=True)}">{esc(s)}</a>' for s, u in sources[:3])
+        more = f" +{len(sources) - 3} more" if len(sources) > 3 else ""
+        line += f"\n   {len(sources)} source{'s' if len(sources) != 1 else ''}: {refs}{more}"
+        if not product and nvd.get("description"):
+            d = nvd["description"]
+            line += "\n   " + esc(d if len(d) <= 160 else d[:157].rsplit(" ", 1)[0] + "…")
+        return line
+
+    sections = [
+        ("🔴 New in CISA KEV", [x for x in ordered if "kev" in x[1]["kinds"]]),
+        ("🦠 Linked to malware", [x for x in ordered if "kev" not in x[1]["kinds"]
+                                   and ("malware" in x[1]["kinds"] or x[1]["malware"])]),
+        ("⚠️ Exploitation reported", [x for x in ordered if not (x[1]["kinds"] & {"kev", "malware"})
+                                      and not x[1]["malware"]]),
+    ]
+    header = (f"📋 <b>Daily threat digest · {now_utc().astimezone(IST):%d %b %Y}</b>\n"
+              f"{len(by_cve)} CVEs from {len({f['source'] for f in recent})} sources in the last 24 hours. "
+              "Sorted by KEV status, confirmation and number of sources.")
+    pieces = [header]
+    for title, items in sections:
+        if items:
+            pieces.append(f"\n<b>{title} ({len(items)})</b>")
+            pieces += [describe(cve, c) for cve, c in items]
+
+    # Pack into Telegram-sized messages (limit 4096 characters), never splitting an entry.
+    messages, current = [], ""
+    for piece in pieces:
+        if current and len(current) + len(piece) + 1 > 3900:
+            messages.append(current)
+            current = ""
+        current += ("\n" if current else "") + piece
+    if current:
+        messages.append(current)
+    return messages
+
+
+def digest_due(state):
+    if os.environ.get("FORCE_DIGEST", "").strip().lower() in {"1", "true", "yes"}:
+        return True
+    now_ist = now_utc().astimezone(IST)
+    hour, minute = (int(x) for x in DIGEST_TIME_IST.split(":"))
+    if (now_ist.hour, now_ist.minute) < (hour, minute):
+        return False
+    return state.get("last_digest") != now_ist.date().isoformat()
 
 
 # ---------------------------------------------------------------------------
@@ -244,12 +578,10 @@ def check_news(state):
 def send_telegram(token, chat_id, text):
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = urllib.parse.urlencode({
-        "chat_id": chat_id,
-        "text": text[:4000],
-        "parse_mode": "HTML",
+        "chat_id": chat_id, "text": text[:4096], "parse_mode": "HTML",
         "disable_web_page_preview": "true",
     }).encode()
-    for attempt in range(3):
+    for _ in range(3):
         try:
             urllib.request.urlopen(urllib.request.Request(url, data=payload), timeout=30)
             return True
@@ -274,43 +606,57 @@ def send_telegram(token, chat_id, text):
 def main():
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+    nvd_key = os.environ.get("NVD_API_KEY", "").strip()
     dry_run = not (token and chat_id)
     if dry_run:
-        log("DRY-RUN: Telegram settings not found, alerts will be printed only")
+        log("DRY-RUN: Telegram settings not found, messages will be printed only")
 
+    config = json.loads(SOURCES_FILE.read_text(encoding="utf-8"))
     state = load_state()
-    first_run = not state
-    alerts = []
+    brand_new = not state
+    state.setdefault("findings", [])
+    run_id = now_utc().isoformat()
+    if "last_digest" not in state:  # first digest comes at the next scheduled time, not now
+        state["last_digest"] = now_utc().astimezone(IST).date().isoformat()
+        state["last_digest_time"] = now_utc().isoformat(timespec="seconds")
 
+    kev = {}
     try:
-        alerts += check_kev(state)
+        kev = check_kev(state, config["kev_url"], run_id)
     except Exception as err:  # one broken source shouldn't stop the others
         log(f"KEV check failed: {err}")
-    alerts += check_news(state)
+    reached = check_feeds(state, config["feeds"], run_id)
 
-    if first_run:
-        alerts = [
+    messages = instant_alerts(state, kev, run_id)
+    if len(messages) > MAX_INSTANT_ALERTS_PER_RUN:
+        extra = len(messages) - MAX_INSTANT_ALERTS_PER_RUN
+        messages = messages[:MAX_INSTANT_ALERTS_PER_RUN]
+        messages.append(f"…and {extra} more new items this run. They'll all be in the daily digest.")
+
+    if brand_new:
+        messages = [
             "✅ <b>Threat Intel Monitor is running.</b>\n"
             f"Watching the CISA KEV catalog ({len(state.get('kev', []))} entries) and "
-            f"{len(state.get('feeds_read', []))} of {len(NEWS_FEEDS)} news feeds. "
-            "You'll get a message here when something new shows up."
+            f"{reached} of {len(config['feeds'])} feeds. Instant alerts arrive as things happen; "
+            f"a daily digest comes at {DIGEST_TIME_IST} IST."
         ]
-
-    if len(alerts) > MAX_ALERTS_PER_RUN:
-        extra = len(alerts) - MAX_ALERTS_PER_RUN
-        alerts = alerts[:MAX_ALERTS_PER_RUN]
-        alerts.append(f"…and {extra} more new items this run. Check the KEV catalog and feeds.")
+    elif digest_due(state):
+        since = parse_time(state.get("last_digest_time")) or (now_utc() - timedelta(days=1))
+        since = max(since, now_utc() - timedelta(days=1, hours=2))
+        messages += build_digest(state, kev, since, nvd_key)
+        state["last_digest"] = now_utc().astimezone(IST).date().isoformat()
+        state["last_digest_time"] = now_utc().isoformat(timespec="seconds")
 
     sent = 0
-    for message in alerts:
+    for message in messages:
         if dry_run:
             print("\n" + "-" * 60 + "\n" + message)
         elif send_telegram(token, chat_id, message):
             sent += 1
-            time.sleep(1)  # be polite to Telegram
+            time.sleep(1)
 
     save_state(state)
-    log(f"Done. {len(alerts)} alerts, {sent} sent.")
+    log(f"Done. {reached}/{len(config['feeds'])} feeds read, {len(messages)} messages, {sent} sent.")
 
 
 if __name__ == "__main__":
