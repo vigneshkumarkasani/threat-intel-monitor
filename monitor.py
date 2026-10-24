@@ -225,6 +225,7 @@ def check_kev(state, kev_url, run_id):
             "title": e.get("vulnerabilityName", ""),
             "link": nvd_link(cve), "malware": [], "terms": [],
             "ransomware": e.get("knownRansomwareCampaignUse", "Unknown").lower() == "known",
+            "summary": e.get("shortDescription", "")[:500],
             "time": now_utc().isoformat(timespec="seconds"), "run": run_id,
         })
     log(f"KEV: {len(new_ids)} new entries")
@@ -385,6 +386,22 @@ def title_is_malware_news(title):
     return bool(malware or names)
 
 
+def make_summary(title, body, limit=500):
+    """The first sentences of an article (skipping a repeat of the headline), up to `limit` characters."""
+    text = strip_html(body).replace("\n\n", " ").strip()
+    if title and text.lower().startswith(title.lower().rstrip("…")):
+        text = text[len(title.rstrip("…")):].lstrip(" .:-–—")
+    text = re.sub(r"\s*(The post .{0,200} appeared first on .{0,100}|Read more|Continue reading)\.?\s*$", "", text)
+    out = ""
+    for sentence in sentences(text):
+        if len(out) + len(sentence) + 1 > limit:
+            break
+        out += (" " if out else "") + sentence
+    if not out and text:
+        out = text[:limit - 1].rsplit(" ", 1)[0] + "…"
+    return out
+
+
 def record_item(state, source, source_type, title, link, body, run_id):
     """Turn one article, advisory or post into findings. Returns how many were added."""
     social = source_type == "social"
@@ -392,6 +409,7 @@ def record_item(state, source, source_type, title, link, body, run_id):
         text = strip_html(body).replace("\n\n", " ")
         title = text[:140] + ("…" if len(text) > 140 else "")
     added = 0
+    summary = make_summary(title, body)
     results = analyse_article(title, body)
     for cve, r in results.items():
         kind = classify(r)
@@ -401,6 +419,7 @@ def record_item(state, source, source_type, title, link, body, run_id):
             "cve": cve, "kind": kind, "source": source, "source_type": source_type,
             "title": title, "link": link,
             "malware": sorted(r["names"]), "terms": sorted(r["malware"] | r["terms"]),
+            "summary": summary,
             "time": now_utc().isoformat(timespec="seconds"), "run": run_id,
         })
         added += 1
@@ -409,6 +428,7 @@ def record_item(state, source, source_type, title, link, body, run_id):
         state["findings"].append({
             "cve": None, "kind": "malware_news", "source": source, "source_type": source_type,
             "title": title, "link": link, "malware": sorted(names), "terms": [],
+            "summary": summary,
             "time": now_utc().isoformat(timespec="seconds"), "run": run_id,
         })
         added += 1
@@ -602,50 +622,62 @@ def epss_lookup(cves):
 # Building messages
 # ---------------------------------------------------------------------------
 
-def instant_alerts(state, kev, run_id):
-    """Turn this run's new findings into Telegram messages, skipping repeats."""
+MAX_ALERT_LOOKUPS = 30  # most CVEs to look up in NVD for instant alerts per run
+DIVIDER = "━━━━━━━━━━━━━━━━━━"
+
+
+def severity_of(cvss, given=None):
+    if given:
+        return given.title()
+    if cvss is None:
+        return None
+    return "Critical" if cvss >= 9 else "High" if cvss >= 7 else "Medium" if cvss >= 4 else "Low"
+
+
+SEVERITY_ICON = {"Critical": "🟥", "High": "🟧", "Medium": "🟨", "Low": "🟩"}
+
+
+def found_time(f):
+    t = parse_time(f.get("time")) or now_utc()
+    return t.astimezone(IST).strftime("%d %b %Y, %I:%M %p IST").replace(" 0", " ").lstrip("0")
+
+
+def score_line(cve, info, epss, kev):
+    """'CVSS 9.9 (Critical) · EPSS 87.0% · in KEV' for one CVE."""
+    bits = []
+    if info.get("cvss") is not None:
+        bits.append(f"CVSS {info['cvss']} ({severity_of(info['cvss'], info.get('severity'))})")
+    else:
+        bits.append("CVSS not published yet")
+    bits.append(f"EPSS {epss[cve] * 100:.1f}%" if cve in epss else "EPSS n/a")
+    bits.append("in KEV ✅" if cve in kev else "not in KEV")
+    return " · ".join(bits)
+
+
+def instant_alerts(state, kev, run_id, api_key=""):
+    """Turn this run's new findings into Telegram messages (dicts with text and buttons)."""
     alerted = state.setdefault("alerted", {})
     fresh = [f for f in state["findings"] if f.get("run") == run_id]
-    messages = []
 
-    # 1) New KEV entries, one message each
-    for f in (x for x in fresh if x["kind"] == "kev"):
-        e = kev.get(f["cve"], {})
-        alerted[f"{f['cve']}|kev"] = f["time"]
-        lines = [
-            "🔴 <b>New CISA KEV entry</b>",
-            f"{cve_link(f['cve'])}: {esc(e.get('vulnerabilityName'))}",
-            f"<b>Product:</b> {esc(e.get('vendorProject'))} {esc(e.get('product'))}",
-            f"<b>Added:</b> {esc(e.get('dateAdded'))} · <b>Federal due date:</b> {esc(e.get('dueDate'))}",
-        ]
-        if f.get("ransomware"):
-            lines.append("🟠 <b>Known ransomware use</b>")
-        if e.get("shortDescription"):
-            lines.append(esc(e["shortDescription"][:400]))
-        messages.append("\n".join(lines))
-
-    # 2) Articles, advisories and posts: one message per item.
-    #    A CVE is alerted again only when the news about it gets more serious
-    #    (plain CVE -> exploited -> malware), so ten copies of one story send one alert.
+    # --- 1) decide what to alert on -------------------------------------------------
+    # A CVE is alerted again only when its news gets more serious:
+    # plain CVE -> exploited -> malware -> KEV. Ten copies of one story send one alert.
     best = {}
     for key in alerted:
         cve, _, kind = key.partition("|")
         best[cve] = max(best.get(cve, -1), KIND_RANK.get(kind, 0))
+    planned = []  # (kind of message, [findings])
+    for f in (x for x in fresh if x["kind"] == "kev"):
+        alerted[f"{f['cve']}|kev"] = f["time"]
+        best[f["cve"]] = KIND_RANK["kev"]
+        planned.append(("kev", [f]))
     by_article = {}
     for f in (x for x in fresh if x["kind"] != "kev"):
         by_article.setdefault(f["link"], []).append(f)
-
     for link, group in by_article.items():
-        first = group[0]
-        link_html = f'<a href="{html.escape(link, quote=True)}">{esc(first["title"])}</a>'
-
-        if first["kind"] == "malware_news":
-            lines = [f"📰 <b>Malware news</b> · {esc(first['source'])}", link_html]
-            if first["malware"]:
-                lines.append(f"<b>Malware:</b> {esc(', '.join(first['malware']))}")
-            messages.append("\n".join(lines))
+        if group[0]["kind"] == "malware_news":
+            planned.append(("malware_news", group[:1]))
             continue
-
         new = []
         for f in group:
             rank = KIND_RANK[f["kind"]]
@@ -653,33 +685,147 @@ def instant_alerts(state, kev, run_id):
                 new.append(f)
                 best[f["cve"]] = rank
                 alerted[f"{f['cve']}|{f['kind']}"] = f["time"]
-        if not new:
-            continue
-        top = max(KIND_RANK[f["kind"]] for f in new)
-        confirmed = first["source_type"] in CONFIRMED_TYPES
-        if top == KIND_RANK["malware"]:
-            heading = "🦠 <b>Malware linked to CVE</b>"
-        elif top == KIND_RANK["exploited"]:
-            heading = ("🛑 <b>Vendor confirms exploitation</b>" if confirmed
-                       else "⚠️ <b>Exploitation reported</b>")
+        if new:
+            planned.append(("article", new))
+
+    # --- 2) look up CVSS and EPSS for the CVEs we're about to report -----------------
+    cves = sorted({f["cve"] for _, group in planned for f in group if f.get("cve")})
+    epss = epss_lookup(cves) if cves else {}
+    info = {}
+    for cve in cves[:MAX_ALERT_LOOKUPS]:
+        info[cve] = nvd_lookup(state, cve, api_key)
+
+    # --- 3) write the messages ------------------------------------------------------
+    messages = []
+    for kind, group in planned:
+        if kind == "kev":
+            messages.append(render_kev(group[0], kev, info, epss))
+        elif kind == "malware_news":
+            messages.append(render_malware_news(group[0]))
         else:
-            heading = ("🆕 <b>New CVE in vendor advisory</b>" if first["source_type"] == "vendor"
-                       else "🆕 <b>New CVE in the news</b>")
-        cves = sorted({f["cve"] for f in new})
-        names = sorted({n for f in new for n in f["malware"]})
-        terms = sorted({t for f in new for t in f["terms"]})
-        in_kev = [c for c in cves if c in kev]
-        lines = [f"{heading} · {esc(first['source'])}", link_html,
-                 "<b>CVEs:</b> " + ", ".join(cve_link(c) for c in cves[:10])
-                 + (f" +{len(cves) - 10} more" if len(cves) > 10 else "")]
-        if names:
-            lines.append(f"<b>Malware:</b> {esc(', '.join(names))}")
-        if terms:
-            lines.append(f"<b>Keywords:</b> {esc(', '.join(terms[:8]))}")
-        if top > KIND_RANK["cve"] or in_kev:
-            lines.append("✅ In CISA KEV: " + ", ".join(in_kev) if in_kev else "⏳ Not in CISA KEV yet")
-        messages.append("\n".join(lines))
+            top = max(KIND_RANK[f["kind"]] for f in group)
+            if top == KIND_RANK["cve"]:
+                messages.append(render_card(group, kev, info, epss))
+            else:
+                messages.append(render_detailed(group, top, kev, info, epss))
     return messages
+
+
+def article_buttons(link, cves, kev, source_type="news"):
+    label = "💬 Open post" if source_type == "social" else "📖 Read article"
+    buttons = [(label, link)] if link.startswith("http") else []
+    if cves:
+        buttons.append(("🔎 NVD", nvd_link(cves[0])))
+    if any(c in kev for c in cves):
+        buttons.append(("🛡 CISA KEV", "https://www.cisa.gov/known-exploited-vulnerabilities-catalog"))
+    return buttons
+
+
+def render_card(group, kev, info, epss):
+    """Compact card for a CVE that isn't known to be exploited."""
+    first = group[0]
+    cves = sorted({f["cve"] for f in group})
+    scores = [info.get(c, {}).get("cvss") for c in cves]
+    worst = max((x for x in scores if x is not None), default=None)
+    sev = severity_of(worst)
+    where = "VENDOR ADVISORY" if first["source_type"] == "vendor" else "NEW CVE"
+    head = f"🆕 <b>{where}</b>" + (f" · {SEVERITY_ICON.get(sev, '')} <b>{sev.upper()}</b>" if sev else "")
+    lines = [head, DIVIDER, f"<b>{esc(first['title'])}</b>", ""]
+    for c in cves[:5]:
+        lines.append(f"<code>{c}</code>")
+        lines.append(f"📊 {esc(score_line(c, info.get(c, {}), epss, kev))}")
+    if len(cves) > 5:
+        lines.append(f"…and {len(cves) - 5} more CVEs")
+    lines += ["", f"📰 {esc(first['source'])}", f"🕒 {found_time(first)}"]
+    if first.get("summary"):
+        short = first["summary"]
+        short = short if len(short) <= 220 else short[:217].rsplit(" ", 1)[0] + "…"
+        lines += ["", f"<i>{esc(short)}</i>"]
+    return {"text": "\n".join(lines), "buttons": article_buttons(first["link"], cves, kev, first["source_type"])}
+
+
+def render_detailed(group, top, kev, info, epss):
+    """Full report for a CVE that is exploited or linked to malware."""
+    first = group[0]
+    cves = sorted({f["cve"] for f in group})
+    confirmed = first["source_type"] in CONFIRMED_TYPES
+    if top == KIND_RANK["malware"]:
+        label = "🦠 <b>MALWARE LINKED TO CVE</b>"
+    elif confirmed:
+        label = "🛑 <b>VENDOR CONFIRMS EXPLOITATION</b>"
+    else:
+        label = "⚠️ <b>EXPLOITATION REPORTED</b>"
+    scores = [info.get(c, {}).get("cvss") for c in cves]
+    sev = severity_of(max((x for x in scores if x is not None), default=None))
+    if sev:
+        label += f" · {SEVERITY_ICON.get(sev, '')} <b>{sev.upper()}</b>"
+    names = sorted({n for f in group for n in f["malware"]})
+    terms = sorted({t for f in group for t in f["terms"]})
+
+    lines = [label, DIVIDER, f"<b>{esc(first['title'])}</b>"]
+    if first.get("summary"):
+        lines += ["", "📝 <b>Summary</b>", f"<blockquote>{esc(first['summary'])}</blockquote>"]
+    lines += ["", "🔢 <b>CVE details</b>"]
+    for c in cves[:8]:
+        lines.append(f"• <code>{c}</code>  {esc(score_line(c, info.get(c, {}), epss, kev))}")
+        desc = info.get(c, {}).get("description")
+        if desc and len(cves) <= 3:
+            lines.append(f"   <i>{esc(desc if len(desc) <= 180 else desc[:177].rsplit(' ', 1)[0] + '…')}</i>")
+    if len(cves) > 8:
+        lines.append(f"…and {len(cves) - 8} more CVEs")
+    lines.append("")
+    if names:
+        lines.append(f"🦠 <b>Malware:</b> {esc(', '.join(names))}")
+    if terms:
+        lines.append(f"🔍 <b>Keywords:</b> {esc(', '.join(terms[:8]))}")
+    in_kev = [c for c in cves if c in kev]
+    lines.append("🛡 <b>CISA KEV:</b> " + (", ".join(in_kev) + " listed" if in_kev else "not listed yet"))
+    lines.append(f"📰 <b>Source:</b> {esc(first['source'])}")
+    lines.append(f"🕒 <b>Found:</b> {found_time(first)}")
+    return {"text": "\n".join(lines), "buttons": article_buttons(first["link"], cves, kev, first["source_type"])}
+
+
+def render_kev(f, kev, info, epss):
+    """Full report for a new CISA KEV entry."""
+    cve = f["cve"]
+    e = kev.get(cve, {})
+    i = info.get(cve, {})
+    sev = severity_of(i.get("cvss"), i.get("severity"))
+    label = "🔴 <b>NEW IN CISA KEV · ACTIVELY EXPLOITED</b>"
+    if sev:
+        label += f" · {SEVERITY_ICON.get(sev, '')} <b>{sev.upper()}</b>"
+    lines = [label, DIVIDER, f"<b>{esc(e.get('vulnerabilityName') or cve)}</b>"]
+    if f.get("summary"):
+        lines += ["", "📝 <b>Summary</b>", f"<blockquote>{esc(f['summary'])}</blockquote>"]
+    lines += ["", "🔢 <b>CVE details</b>",
+              f"• <code>{cve}</code>  {esc(score_line(cve, i, epss, kev))}",
+              "",
+              f"🏢 <b>Product:</b> {esc(e.get('vendorProject'))} {esc(e.get('product'))}",
+              f"📅 <b>Added:</b> {esc(e.get('dateAdded'))} · <b>Federal due date:</b> {esc(e.get('dueDate'))}"]
+    if f.get("ransomware"):
+        lines.append("🟠 <b>Known ransomware use</b>")
+    if e.get("requiredAction"):
+        action = e["requiredAction"]
+        lines.append(f"🛠 <b>Action:</b> {esc(action if len(action) <= 200 else action[:197] + '…')}")
+    lines.append(f"🕒 <b>Found:</b> {found_time(f)}")
+    buttons = [("🔎 NVD", nvd_link(cve)),
+               ("🛡 CISA KEV", "https://www.cisa.gov/known-exploited-vulnerabilities-catalog")]
+    return {"text": "\n".join(lines), "buttons": buttons}
+
+
+def render_malware_news(f):
+    """Full report for a malware article that names no CVE."""
+    lines = ["📰 <b>MALWARE NEWS</b>", DIVIDER, f"<b>{esc(f['title'])}</b>"]
+    if f.get("summary"):
+        lines += ["", "📝 <b>Summary</b>", f"<blockquote>{esc(f['summary'])}</blockquote>"]
+    lines.append("")
+    if f["malware"]:
+        lines.append(f"🦠 <b>Malware:</b> {esc(', '.join(f['malware']))}")
+    lines.append("🔢 <b>CVEs:</b> none named in the article")
+    lines.append(f"📰 <b>Source:</b> {esc(f['source'])}")
+    lines.append(f"🕒 <b>Found:</b> {found_time(f)}")
+    buttons = [("📖 Read article", f["link"])] if f["link"].startswith("http") else []
+    return {"text": "\n".join(lines), "buttons": buttons}
 
 
 def build_digest(state, kev, since, api_key):
@@ -797,12 +943,14 @@ def digest_due(state):
 # Telegram
 # ---------------------------------------------------------------------------
 
-def send_telegram(token, chat_id, text):
+def send_telegram(token, chat_id, text, buttons=None):
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = urllib.parse.urlencode({
-        "chat_id": chat_id, "text": text[:4096], "parse_mode": "HTML",
-        "disable_web_page_preview": "true",
-    }).encode()
+    fields = {"chat_id": chat_id, "text": text[:4096], "parse_mode": "HTML",
+              "disable_web_page_preview": "true"}
+    if buttons:  # one row of tap-able link buttons under the message
+        fields["reply_markup"] = json.dumps(
+            {"inline_keyboard": [[{"text": label, "url": u} for label, u in buttons]]})
+    payload = urllib.parse.urlencode(fields).encode()
     for _ in range(3):
         try:
             urllib.request.urlopen(urllib.request.Request(url, data=payload), timeout=30)
@@ -812,6 +960,13 @@ def send_telegram(token, chat_id, text):
             if err.code == 429:  # Telegram says "slow down"
                 wait = json.loads(body).get("parameters", {}).get("retry_after", 5)
                 time.sleep(wait + 1)
+                continue
+            if err.code == 400 and fields.get("parse_mode"):
+                # Telegram couldn't read the formatting: resend as plain text so the alert isn't lost
+                log(f"Telegram rejected the formatting ({body[:120]}), resending as plain text")
+                fields.pop("parse_mode")
+                fields["text"] = html.unescape(re.sub(r"<[^>]+>", "", fields["text"]))
+                payload = urllib.parse.urlencode(fields).encode()
                 continue
             log(f"Telegram error {err.code}: {body}")
             return False
@@ -851,7 +1006,7 @@ def main():
     check_bluesky(state, config, run_id)
     check_x(state, config, run_id)
 
-    messages = instant_alerts(state, kev, run_id)
+    messages = instant_alerts(state, kev, run_id, nvd_key)
     if len(messages) > MAX_INSTANT_ALERTS_PER_RUN:
         extra = len(messages) - MAX_INSTANT_ALERTS_PER_RUN
         messages = messages[:MAX_INSTANT_ALERTS_PER_RUN]
@@ -873,9 +1028,12 @@ def main():
 
     sent = 0
     for message in messages:
+        text, buttons = (message["text"], message.get("buttons")) if isinstance(message, dict) else (message, None)
         if dry_run:
-            print("\n" + "-" * 60 + "\n" + message)
-        elif send_telegram(token, chat_id, message):
+            print("\n" + "-" * 60 + "\n" + text)
+            if buttons:
+                print("   " + "  ".join(f"[ {label} ]" for label, _ in buttons))
+        elif send_telegram(token, chat_id, text, buttons):
             sent += 1
             time.sleep(1)
 
