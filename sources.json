@@ -1,33 +1,54 @@
 {
   "kev_url": "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json",
   "feeds": [
-    {"name": "The Hacker News",        "type": "news",     "url": "https://feeds.feedburner.com/TheHackersNews"},
-    {"name": "BleepingComputer",       "type": "news",     "url": "https://www.bleepingcomputer.com/feed/"},
-    {"name": "SecurityWeek",           "type": "news",     "url": "https://www.securityweek.com/feed/"},
-    {"name": "Help Net Security",      "type": "news",     "url": "https://www.helpnetsecurity.com/feed/"},
-    {"name": "Dark Reading",           "type": "news",     "url": "https://www.darkreading.com/rss.xml"},
-    {"name": "The Record",             "type": "news",     "url": "https://therecord.media/feed"},
-    {"name": "Cyber Security News",    "type": "news",     "url": "https://cybersecuritynews.com/feed/"},
-    {"name": "GBHackers",              "type": "news",     "url": "https://gbhackers.com/feed/"},
-    {"name": "Infosecurity Magazine",  "type": "news",     "url": "https://www.infosecurity-magazine.com/rss/news/"},
-
-    {"name": "Unit 42",                "type": "research", "url": "https://unit42.paloaltonetworks.com/feed/"},
-    {"name": "Rapid7",                 "type": "research", "url": "https://www.rapid7.com/blog/rss/"},
-    {"name": "watchTowr Labs",         "type": "research", "url": "https://labs.watchtowr.com/rss/"},
-    {"name": "Cisco Talos",            "type": "research", "url": "https://blog.talosintelligence.com/rss/"},
-    {"name": "Microsoft Security Blog","type": "research", "url": "https://www.microsoft.com/en-us/security/blog/feed/"},
-    {"name": "Kaspersky Securelist",   "type": "research", "url": "https://securelist.com/feed/"},
-    {"name": "Check Point Research",   "type": "research", "url": "https://research.checkpoint.com/feed/"},
-    {"name": "Huntress",               "type": "research", "url": "https://www.huntress.com/blog/rss.xml"},
-    {"name": "SANS ISC",               "type": "research", "url": "https://isc.sans.edu/rssfeed_full.xml"},
-    {"name": "AWS Security Blog",      "type": "research", "url": "https://aws.amazon.com/blogs/security/feed/"},
-    {"name": "Sophos",                 "type": "research", "url": "https://www.sophos.com/en-us/blog/feed"},
-
-    {"name": "Cisco Advisories",       "type": "vendor",   "url": "https://sec.cloudapps.cisco.com/security/center/psirtrss20/CiscoSecurityAdvisory.xml"},
-    {"name": "Fortinet PSIRT",         "type": "vendor",   "url": "https://filestore.fortinet.com/fortiguard/rss/ir.xml"},
-    {"name": "Palo Alto Advisories",   "type": "vendor",   "url": "https://security.paloaltonetworks.com/rss.xml"},
-    {"name": "Google Chrome Releases", "type": "vendor",   "url": "https://feeds.feedburner.com/GoogleChromeReleases"},
-
-    {"name": "CISA Advisories",        "type": "government","url": "https://www.cisa.gov/cybersecurity-advisories/all.xml"}
-  ]
+    {"name": "The Hacker News", "type": "news", "url": "https://feeds.feedburner.com/TheHackersNews"},
+    {"name": "BleepingComputer", "type": "news", "url": "https://www.bleepingcomputer.com/feed/"},
+    {"name": "SecurityWeek", "type": "news", "url": "https://www.securityweek.com/feed/"},
+    {"name": "Help Net Security", "type": "news", "url": "https://www.helpnetsecurity.com/feed/"},
+    {"name": "Dark Reading", "type": "news", "url": "https://www.darkreading.com/rss.xml"},
+    {"name": "The Record", "type": "news", "url": "https://therecord.media/feed"},
+    {"name": "Cyber Security News", "type": "news", "url": "https://cybersecuritynews.com/feed/"},
+    {"name": "GBHackers", "type": "news", "url": "https://gbhackers.com/feed/"},
+    {"name": "Infosecurity Magazine", "type": "news", "url": "https://www.infosecurity-magazine.com/rss/news/"},
+    {"name": "Unit 42", "type": "research", "url": "https://unit42.paloaltonetworks.com/feed/"},
+    {"name": "Rapid7", "type": "research", "url": "https://www.rapid7.com/blog/rss/"},
+    {"name": "watchTowr Labs", "type": "research", "url": "https://labs.watchtowr.com/rss/"},
+    {"name": "Cisco Talos", "type": "research", "url": "https://blog.talosintelligence.com/rss/"},
+    {"name": "Microsoft Security Blog", "type": "research", "url": "https://www.microsoft.com/en-us/security/blog/feed/"},
+    {"name": "Kaspersky Securelist", "type": "research", "url": "https://securelist.com/feed/"},
+    {"name": "Check Point Research", "type": "research", "url": "https://research.checkpoint.com/feed/"},
+    {"name": "Huntress", "type": "research", "url": "https://www.huntress.com/blog/rss.xml"},
+    {"name": "SANS ISC", "type": "research", "url": "https://isc.sans.edu/rssfeed_full.xml"},
+    {"name": "AWS Security Blog", "type": "research", "url": "https://aws.amazon.com/blogs/security/feed/"},
+    {"name": "Sophos", "type": "research", "url": "https://www.sophos.com/en-us/blog/feed"},
+    {"name": "Google Threat Intelligence (Mandiant)", "type": "research", "url": "https://feeds.feedburner.com/threatintelligence/pvexyqv7v0v"},
+    {"name": "Cisco Advisories", "type": "vendor", "url": "https://sec.cloudapps.cisco.com/security/center/psirtrss20/CiscoSecurityAdvisory.xml"},
+    {"name": "Fortinet PSIRT", "type": "vendor", "url": "https://filestore.fortinet.com/fortiguard/rss/ir.xml"},
+    {"name": "Palo Alto Advisories", "type": "vendor", "url": "https://security.paloaltonetworks.com/rss.xml"},
+    {"name": "Google Chrome Releases", "type": "vendor", "url": "https://feeds.feedburner.com/GoogleChromeReleases"},
+    {"name": "CISA Advisories", "type": "government", "url": "https://www.cisa.gov/cybersecurity-advisories/all.xml"},
+    {"name": "Mastodon #cve", "type": "social", "url": "https://mastodon.social/tags/cve.rss"},
+    {"name": "Mastodon #zeroday", "type": "social", "url": "https://mastodon.social/tags/zeroday.rss"},
+    {"name": "Mastodon #ransomware", "type": "social", "url": "https://mastodon.social/tags/ransomware.rss"},
+    {"name": "Mastodon #malware", "type": "social", "url": "https://mastodon.social/tags/malware.rss"},
+    {"name": "Mastodon #threatintel", "type": "social", "url": "https://mastodon.social/tags/threatintel.rss"}
+  ],
+  "bluesky": {
+    "_note": "Optional. Needs BLUESKY_HANDLE and BLUESKY_APP_PASSWORD secrets. Free.",
+    "queries": [
+      "CVE exploited",
+      "CVE \"in the wild\"",
+      "CVE zero-day",
+      "CVE ransomware",
+      "CVE malware"
+    ],
+    "limit": 25,
+    "every_minutes": 15
+  },
+  "x": {
+    "_note": "Optional and paid (about $0.005 per post read). Needs the X_BEARER_TOKEN secret. Stops for the day at max_reads_per_day.",
+    "query": "CVE (exploited OR \"in the wild\" OR zero-day OR 0day OR ransomware OR malware OR botnet OR backdoor OR webshell) -is:retweet -is:reply lang:en",
+    "max_reads_per_day": 150,
+    "max_per_run": 20
+  }
 }

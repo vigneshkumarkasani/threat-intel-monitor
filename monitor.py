@@ -1,28 +1,31 @@
 """
 Threat Intel Monitor
 ====================
-Watches for actively exploited CVEs and CVEs linked to malware, and reports
-them on Telegram in two ways:
+Watches news sites, research blogs, vendor advisories, CISA and social media
+for new CVEs and malware, and reports them on Telegram within minutes:
 
-  * INSTANT ALERTS (every hourly run)
-      - a CVE newly added to CISA's Known Exploited Vulnerabilities (KEV) catalog
-      - an article or vendor advisory that names a CVE together with malware
-        or in-the-wild exploitation, the first time that CVE is seen that way
+  * INSTANT ALERTS (every run, every 5 minutes on GitHub Actions)
+      🔴 a CVE newly added to CISA's Known Exploited Vulnerabilities catalog
+      🦠 a CVE linked to malware or a named malware family
+      🛑 / ⚠️ a CVE reported as exploited (by a vendor, or in news/research)
+      🆕 the first time a CVE appears in any news, research or vendor source
+      📰 a malware article, even if it names no CVE
+    A CVE is alerted again only when its news gets more serious
+    (new CVE -> exploited -> malware -> KEV), so one story copied by ten
+    sites sends one alert. Social posts alert only on exploitation/malware.
   * DAILY DIGEST (once a day, at DIGEST_TIME_IST)
-      - everything from the last 24 hours, grouped by CVE, with CVSS, EPSS,
-        KEV status, named malware and how many sources reported it
+      everything from the last 24 hours, grouped by CVE, with CVSS, EPSS,
+      KEV status, named malware and how many sources reported it
 
-Sources live in sources.json and malware names in malware_names.txt, so you
-can add or remove them without touching this code.
-
-What has already been seen is remembered in seen.json, which GitHub Actions
-saves back to the repository after every run.
+Sources live in sources.json and malware names in malware_names.txt.
+What has already been seen is remembered in seen.json.
 
 Settings come from environment variables (GitHub "secrets"):
-  TELEGRAM_BOT_TOKEN   token from @BotFather              (required to send)
-  TELEGRAM_CHAT_ID     your chat ID                       (required to send)
-  NVD_API_KEY          free key from NVD, makes lookups faster (optional)
-  FORCE_DIGEST         set to "true" to send the digest right now (optional)
+  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID   required to send messages
+  NVD_API_KEY                            optional, faster CVSS lookups (free)
+  BLUESKY_HANDLE, BLUESKY_APP_PASSWORD   optional, turns on Bluesky search (free)
+  X_BEARER_TOKEN                         optional, turns on X/Twitter search (paid)
+  FORCE_DIGEST                           "true" sends the digest right now
 Without the Telegram settings the script runs in DRY-RUN mode and prints
 the messages instead of sending them.
 
@@ -47,7 +50,7 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 DIGEST_TIME_IST = "09:00"        # when the daily digest is sent (India time)
-MAX_INSTANT_ALERTS_PER_RUN = 20  # stops a flood of messages on a busy day
+MAX_INSTANT_ALERTS_PER_RUN = 30  # stops a flood of messages on a busy day
 MAX_DIGEST_LOOKUPS = 40          # most CVEs to look up in NVD per digest
 FINDINGS_KEPT_DAYS = 7           # how long findings are kept for the digest
 ALERT_REPEAT_DAYS = 14           # don't re-alert the same CVE for the same reason
@@ -87,6 +90,7 @@ IST = timezone(timedelta(hours=5, minutes=30))
 CVE_PATTERN = re.compile(r"\bCVE-\d{4}-\d{4,7}\b", re.IGNORECASE)
 USER_AGENT = "Mozilla/5.0 (compatible; ThreatIntelMonitor/2.0; +https://github.com)"
 CONFIRMED_TYPES = {"vendor", "government"}  # an exploitation claim from these counts as confirmed
+KIND_RANK = {"cve": 0, "exploited": 1, "malware": 2, "kev": 3}
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +186,7 @@ def load_state():
 
 
 def save_state(state):
+    state.pop("_seen_set", None)
     cutoff_findings = now_utc() - timedelta(days=FINDINGS_KEPT_DAYS)
     cutoff_alerts = now_utc() - timedelta(days=ALERT_REPEAT_DAYS)
     state["articles"] = state.get("articles", [])[-6000:]
@@ -311,8 +316,52 @@ def analyse_article(title, body):
             r["terms"] |= exploit
             r["names"] |= names
 
-    # A named malware family counts as a malware link even if no generic word was used.
-    return {c: r for c, r in results.items() if r["malware"] or r["terms"] or r["names"]}
+    return results
+
+
+def classify(r):
+    """Which kind of finding a CVE result is: malware > exploited > plain cve."""
+    if r["malware"] or r["names"]:
+        return "malware"  # a named family counts even without a generic word
+    if r["terms"]:
+        return "exploited"
+    return "cve"
+
+
+def title_is_malware_news(title):
+    """True when a headline is about malware or a named family (used for articles with no CVE)."""
+    malware, _, names = sentence_signals(title)
+    return bool(malware or names)
+
+
+def record_item(state, source, source_type, title, link, body, run_id):
+    """Turn one article, advisory or post into findings. Returns how many were added."""
+    social = source_type == "social"
+    if not title:  # social posts have no headline: use the start of the text
+        text = strip_html(body).replace("\n\n", " ")
+        title = text[:140] + ("…" if len(text) > 140 else "")
+    added = 0
+    results = analyse_article(title, body)
+    for cve, r in results.items():
+        kind = classify(r)
+        if social and kind == "cve":
+            continue  # social: only exploitation/malware posts (bots announce every CVE)
+        state["findings"].append({
+            "cve": cve, "kind": kind, "source": source, "source_type": source_type,
+            "title": title, "link": link,
+            "malware": sorted(r["names"]), "terms": sorted(r["malware"] | r["terms"]),
+            "time": now_utc().isoformat(timespec="seconds"), "run": run_id,
+        })
+        added += 1
+    if not results and not social and title_is_malware_news(title):
+        _, _, names = sentence_signals(title + ". " + strip_html(body)[:2000])
+        state["findings"].append({
+            "cve": None, "kind": "malware_news", "source": source, "source_type": source_type,
+            "title": title, "link": link, "malware": sorted(names), "terms": [],
+            "time": now_utc().isoformat(timespec="seconds"), "run": run_id,
+        })
+        added += 1
+    return added
 
 
 def check_feeds(state, feeds, run_id):
@@ -340,22 +389,115 @@ def check_feeds(state, feeds, run_id):
             remembered.append(link)
             if first_read:
                 continue  # remember the backlog, don't report it
-            for cve, r in analyse_article(title, body).items():
-                state["findings"].append({
-                    "cve": cve,
-                    "kind": "malware" if (r["malware"] or r["names"]) else "exploited",
-                    "source": name, "source_type": kind,
-                    "title": title, "link": link,
-                    "malware": sorted(r["names"]), "terms": sorted(r["malware"] | r["terms"]),
-                    "time": now_utc().isoformat(timespec="seconds"), "run": run_id,
-                })
-                new_matches += 1
+            new_matches += record_item(state, name, kind, title, link, body, run_id)
         note = " (first read: saved without alerts)" if first_read else ""
         log(f"{name}: {len(items)} items, {new_matches} new CVE matches{note}")
 
     state["articles"] = remembered
     state["feeds_read"] = sorted(feeds_read)
     return reached
+
+
+# ---------------------------------------------------------------------------
+# Optional social sources: Bluesky (free login) and X/Twitter (paid API)
+# ---------------------------------------------------------------------------
+
+def remember_post(state, link, source):
+    """True if this post is new. The first time a source is read, only remember."""
+    seen = state.setdefault("_seen_set", set(state.get("articles", [])))
+    if link in seen:
+        return False
+    seen.add(link)
+    state["articles"].append(link)
+    return source in state.get("feeds_read", [])
+
+
+def check_bluesky(state, config, run_id):
+    handle = os.environ.get("BLUESKY_HANDLE", "").strip()
+    password = os.environ.get("BLUESKY_APP_PASSWORD", "").strip()
+    settings = config.get("bluesky", {})
+    if not (handle and password and settings.get("queries")):
+        return 0
+    last = parse_time(state.get("bluesky_last"))
+    if last and now_utc() - last < timedelta(minutes=settings.get("every_minutes", 15) - 1):
+        return 0  # logins are rate-limited, so Bluesky is searched less often
+    try:
+        session = json.loads(fetch(
+            "https://bsky.social/xrpc/com.atproto.server.createSession",
+            data=json.dumps({"identifier": handle, "password": password}).encode(),
+            headers={"Content-Type": "application/json"}))
+        auth = {"Authorization": f"Bearer {session['accessJwt']}"}
+    except Exception as err:
+        log(f"Bluesky login failed: {err}")
+        return 0
+    state["bluesky_last"] = now_utc().isoformat(timespec="seconds")
+    added = 0
+    for query in settings["queries"]:
+        url = ("https://bsky.social/xrpc/app.bsky.feed.searchPosts?sort=latest&limit="
+               f"{settings.get('limit', 25)}&q=" + urllib.parse.quote(query))
+        try:
+            posts = json.loads(fetch(url, headers=auth)).get("posts", [])
+        except Exception as err:
+            log(f"Bluesky search '{query}' failed: {err}")
+            continue
+        for post in posts:
+            rkey = post.get("uri", "").rsplit("/", 1)[-1]
+            who = post.get("author", {}).get("handle", "")
+            link = f"https://bsky.app/profile/{who}/post/{rkey}"
+            if remember_post(state, link, "Bluesky"):
+                added += record_item(state, f"Bluesky @{who}", "social", "",
+                                     link, post.get("record", {}).get("text", ""), run_id)
+    if "Bluesky" not in state["feeds_read"]:
+        state["feeds_read"].append("Bluesky")
+        log("Bluesky: first read, saved posts without alerts")
+    log(f"Bluesky: {added} new CVE matches")
+    return added
+
+
+def check_x(state, config, run_id):
+    token = os.environ.get("X_BEARER_TOKEN", "").strip()
+    settings = config.get("x", {})
+    if not (token and settings.get("query")):
+        return 0
+    today = now_utc().date().isoformat()
+    usage = state.get("x_reads", {})
+    if usage.get("date") != today:
+        usage = {"date": today, "count": 0}
+    remaining = settings.get("max_reads_per_day", 150) - usage["count"]
+    want = min(settings.get("max_per_run", 20), remaining)
+    if want < 10:  # X requires at least 10 results per request
+        log("X: daily read budget used up, skipping until tomorrow (UTC)")
+        return 0
+    params = {"query": settings["query"], "max_results": str(min(want, 100)),
+              "tweet.fields": "created_at", "expansions": "author_id", "user.fields": "username"}
+    if state.get("x_since_id"):
+        params["since_id"] = state["x_since_id"]
+    url = "https://api.x.com/2/tweets/search/recent?" + urllib.parse.urlencode(params)
+    try:
+        data = json.loads(fetch(url, headers={"Authorization": f"Bearer {token}"}))
+    except urllib.error.HTTPError as err:
+        log(f"X search failed ({err.code}): {err.read().decode(errors='replace')[:300]}")
+        return 0
+    except Exception as err:
+        log(f"X search failed: {err}")
+        return 0
+    tweets = data.get("data", [])
+    users = {u["id"]: u.get("username", "") for u in data.get("includes", {}).get("users", [])}
+    usage["count"] += len(tweets)
+    state["x_reads"] = usage
+    if data.get("meta", {}).get("newest_id"):
+        state["x_since_id"] = data["meta"]["newest_id"]
+    added = 0
+    for t in tweets:
+        who = users.get(t.get("author_id"), "i")
+        link = f"https://x.com/{who}/status/{t['id']}"
+        if remember_post(state, link, "X"):
+            added += record_item(state, f"X @{who}", "social", "", link, t.get("text", ""), run_id)
+    if "X" not in state["feeds_read"]:
+        state["feeds_read"].append("X")
+        log("X: first read, saved posts without alerts")
+    log(f"X: {len(tweets)} posts read (today's total {usage['count']}), {added} new CVE matches")
+    return added
 
 
 # ---------------------------------------------------------------------------
@@ -431,43 +573,60 @@ def instant_alerts(state, kev, run_id):
             lines.append(esc(e["shortDescription"][:400]))
         messages.append("\n".join(lines))
 
-    # 2) Articles and advisories, one message per article, only for CVEs not alerted recently
+    # 2) Articles, advisories and posts: one message per item.
+    #    A CVE is alerted again only when the news about it gets more serious
+    #    (plain CVE -> exploited -> malware), so ten copies of one story send one alert.
+    best = {}
+    for key in alerted:
+        cve, _, kind = key.partition("|")
+        best[cve] = max(best.get(cve, -1), KIND_RANK.get(kind, 0))
     by_article = {}
     for f in (x for x in fresh if x["kind"] != "kev"):
         by_article.setdefault(f["link"], []).append(f)
+
     for link, group in by_article.items():
-        new_cves = []
-        for f in group:
-            key = f"{f['cve']}|{f['kind']}"
-            if key not in alerted:
-                new_cves.append(f)
-                alerted[key] = f["time"]
-        if not new_cves:
-            continue
         first = group[0]
-        is_malware = any(f["kind"] == "malware" for f in new_cves)
+        link_html = f'<a href="{html.escape(link, quote=True)}">{esc(first["title"])}</a>'
+
+        if first["kind"] == "malware_news":
+            lines = [f"📰 <b>Malware news</b> · {esc(first['source'])}", link_html]
+            if first["malware"]:
+                lines.append(f"<b>Malware:</b> {esc(', '.join(first['malware']))}")
+            messages.append("\n".join(lines))
+            continue
+
+        new = []
+        for f in group:
+            rank = KIND_RANK[f["kind"]]
+            if rank > best.get(f["cve"], -1):
+                new.append(f)
+                best[f["cve"]] = rank
+                alerted[f"{f['cve']}|{f['kind']}"] = f["time"]
+        if not new:
+            continue
+        top = max(KIND_RANK[f["kind"]] for f in new)
         confirmed = first["source_type"] in CONFIRMED_TYPES
-        if is_malware:
+        if top == KIND_RANK["malware"]:
             heading = "🦠 <b>Malware linked to CVE</b>"
-        elif confirmed:
-            heading = "🛑 <b>Vendor confirms exploitation</b>"
+        elif top == KIND_RANK["exploited"]:
+            heading = ("🛑 <b>Vendor confirms exploitation</b>" if confirmed
+                       else "⚠️ <b>Exploitation reported</b>")
         else:
-            heading = "⚠️ <b>Exploitation reported</b>"
-        cves = sorted({f["cve"] for f in new_cves})
-        names = sorted({n for f in new_cves for n in f["malware"]})
-        terms = sorted({t for f in new_cves for t in f["terms"]})
+            heading = ("🆕 <b>New CVE in vendor advisory</b>" if first["source_type"] == "vendor"
+                       else "🆕 <b>New CVE in the news</b>")
+        cves = sorted({f["cve"] for f in new})
+        names = sorted({n for f in new for n in f["malware"]})
+        terms = sorted({t for f in new for t in f["terms"]})
         in_kev = [c for c in cves if c in kev]
-        lines = [
-            f"{heading} · {esc(first['source'])}",
-            f'<a href="{html.escape(link, quote=True)}">{esc(first["title"])}</a>',
-            "<b>CVEs:</b> " + ", ".join(cve_link(c) for c in cves[:10]),
-        ]
+        lines = [f"{heading} · {esc(first['source'])}", link_html,
+                 "<b>CVEs:</b> " + ", ".join(cve_link(c) for c in cves[:10])
+                 + (f" +{len(cves) - 10} more" if len(cves) > 10 else "")]
         if names:
             lines.append(f"<b>Malware:</b> {esc(', '.join(names))}")
         if terms:
             lines.append(f"<b>Keywords:</b> {esc(', '.join(terms[:8]))}")
-        lines.append("✅ Already in CISA KEV: " + ", ".join(in_kev) if in_kev
-                     else "⏳ Not in CISA KEV yet")
+        if top > KIND_RANK["cve"] or in_kev:
+            lines.append("✅ In CISA KEV: " + ", ".join(in_kev) if in_kev else "⏳ Not in CISA KEV yet")
         messages.append("\n".join(lines))
     return messages
 
@@ -475,7 +634,9 @@ def instant_alerts(state, kev, run_id):
 def build_digest(state, kev, since, api_key):
     """Group the last day's findings by CVE and write the digest messages."""
     recent = [f for f in state.get("findings", []) if (parse_time(f["time"]) or since) >= since]
-    if not recent:
+    news_only = [f for f in recent if f["kind"] == "malware_news"]
+    recent = [f for f in recent if f["kind"] != "malware_news"]
+    if not recent and not news_only:
         return [f"📋 <b>Daily threat digest · {now_utc().astimezone(IST):%d %b %Y}</b>\n"
                 "Nothing new in the last 24 hours across all sources."]
 
@@ -486,7 +647,8 @@ def build_digest(state, kev, since, api_key):
         c["kinds"].add(f["kind"])
         c["sources"].setdefault(f["source"], f["link"])
         c["malware"] |= set(f.get("malware", []))
-        c["confirmed"] |= f["source_type"] in CONFIRMED_TYPES or f["kind"] == "kev"
+        c["confirmed"] |= ((f["source_type"] in CONFIRMED_TYPES and f["kind"] in ("exploited", "malware"))
+                           or f["kind"] == "kev")
         c["ransomware"] |= bool(f.get("ransomware"))
 
     for cve, c in by_cve.items():
@@ -494,7 +656,7 @@ def build_digest(state, kev, since, api_key):
         if c["in_kev"] and kev[cve].get("knownRansomwareCampaignUse", "").lower() == "known":
             c["ransomware"] = True
 
-    epss = epss_lookup(sorted(by_cve))
+    epss = epss_lookup(sorted(by_cve)) if by_cve else {}
 
     def rank(item):
         cve, c = item
@@ -537,17 +699,26 @@ def build_digest(state, kev, since, api_key):
         ("🔴 New in CISA KEV", [x for x in ordered if "kev" in x[1]["kinds"]]),
         ("🦠 Linked to malware", [x for x in ordered if "kev" not in x[1]["kinds"]
                                    and ("malware" in x[1]["kinds"] or x[1]["malware"])]),
-        ("⚠️ Exploitation reported", [x for x in ordered if not (x[1]["kinds"] & {"kev", "malware"})
+        ("⚠️ Exploitation reported", [x for x in ordered if "exploited" in x[1]["kinds"]
+                                      and not (x[1]["kinds"] & {"kev", "malware"})
                                       and not x[1]["malware"]]),
+        ("🆕 Other new CVEs in the news", [x for x in ordered if x[1]["kinds"] == {"cve"}]),
     ]
+    sources_count = len({f["source"] for f in recent + news_only})
     header = (f"📋 <b>Daily threat digest · {now_utc().astimezone(IST):%d %b %Y}</b>\n"
-              f"{len(by_cve)} CVEs from {len({f['source'] for f in recent})} sources in the last 24 hours. "
-              "Sorted by KEV status, confirmation and number of sources.")
+              f"{len(by_cve)} CVEs and {len(news_only)} malware stories from {sources_count} sources "
+              "in the last 24 hours. Most urgent first.")
     pieces = [header]
     for title, items in sections:
         if items:
             pieces.append(f"\n<b>{title} ({len(items)})</b>")
             pieces += [describe(cve, c) for cve, c in items]
+    if news_only:
+        pieces.append(f"\n<b>📰 Malware news without a CVE ({len(news_only)})</b>")
+        for f in news_only[:40]:
+            extra = f" · 🦠 {esc(', '.join(f['malware']))}" if f["malware"] else ""
+            pieces.append(f'• <a href="{html.escape(f["link"], quote=True)}">{esc(f["title"])}</a>'
+                          f" · {esc(f['source'])}{extra}")
 
     # Pack into Telegram-sized messages (limit 4096 characters), never splitting an entry.
     messages, current = [], ""
@@ -626,6 +797,8 @@ def main():
     except Exception as err:  # one broken source shouldn't stop the others
         log(f"KEV check failed: {err}")
     reached = check_feeds(state, config["feeds"], run_id)
+    check_bluesky(state, config, run_id)
+    check_x(state, config, run_id)
 
     messages = instant_alerts(state, kev, run_id)
     if len(messages) > MAX_INSTANT_ALERTS_PER_RUN:
