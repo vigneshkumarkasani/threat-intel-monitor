@@ -2,7 +2,7 @@ name: Threat Intel Monitor
 
 on:
   schedule:
-       - cron: "*/20 * * * *"  # every 20 minutes (backup to cron-job.org); busy times can delay a run
+    - cron: "*/20 * * * *"  # every 20 minutes (backup to cron-job.org); busy times can delay a run
   workflow_dispatch:        # adds a "Run workflow" button so you can test it any time
     inputs:
       force_digest:
@@ -47,6 +47,7 @@ jobs:
           BLUESKY_HANDLE: ${{ secrets.BLUESKY_HANDLE }}
           BLUESKY_APP_PASSWORD: ${{ secrets.BLUESKY_APP_PASSWORD }}
           X_BEARER_TOKEN: ${{ secrets.X_BEARER_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # provided by GitHub automatically, for its API
           FORCE_DIGEST: ${{ inputs.force_digest }}
         run: python monitor.py
 
@@ -55,6 +56,22 @@ jobs:
         with:
           path: seen.json
           key: state-${{ github.run_id }}
+
+      - name: Publish dashboard data
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          [ -f feed.json ] || { echo "No dashboard data this run"; exit 0; }
+          dir=$(mktemp -d)
+          cp feed.json "$dir/"
+          cd "$dir"
+          git init -q -b dashboard-data
+          git config user.name "threat-intel-monitor[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add feed.json
+          git commit -q -m "Dashboard data"
+          # A single commit, replaced every run, so this branch never builds up history
+          git push -q --force "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" dashboard-data
 
       - name: Daily backup to the repo
         run: |
