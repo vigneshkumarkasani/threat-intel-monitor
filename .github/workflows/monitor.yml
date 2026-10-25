@@ -2,7 +2,7 @@ name: Threat Intel Monitor
 
 on:
   schedule:
-    - cron: "*/25 * * * *"  # every 25 minutes (backup to cron-job.org); busy times can delay a run
+    - cron: "*/20 * * * *"  # every 20 minutes (backup to cron-job.org); busy times can delay a run
   workflow_dispatch:        # adds a "Run workflow" button so you can test it any time
     inputs:
       force_digest:
@@ -23,9 +23,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Get the code
-        uses: actions/checkout@v5
-        with:
-          fetch-depth: 0    # full history, so the backup step can see when it last ran
+        uses: actions/checkout@v5   # latest commit only: fast, and doesn't slow down as backups pile up
 
       - name: Load the bot's memory
         uses: actions/cache/restore@v4
@@ -34,12 +32,8 @@ jobs:
           key: state-${{ github.run_id }}
           restore-keys: state-
 
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-
       - name: Run the monitor
+        timeout-minutes: 11         # stop the script itself in time for its memory to be saved below
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -49,9 +43,10 @@ jobs:
           X_BEARER_TOKEN: ${{ secrets.X_BEARER_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # provided by GitHub automatically, for its API
           FORCE_DIGEST: ${{ inputs.force_digest }}
-        run: python monitor.py
+        run: python3 monitor.py      # the runner already has Python 3; the script needs nothing else
 
       - name: Save the bot's memory
+        if: always()                 # even if the run failed or was cut short, keep what it already sent
         uses: actions/cache/save@v4
         with:
           path: seen.json
@@ -75,19 +70,32 @@ jobs:
 
       - name: Daily backup to the repo
         run: |
-          last=$(git log -1 --format=%ct -- seen.json 2>/dev/null || echo 0)
-          now=$(date +%s)
-          if [ $(( now - ${last:-0} )) -lt 72000 ]; then
-            echo "Backup made in the last 20 hours, skipping"
-            exit 0
-          fi
+          # monitor.py leaves a "backup_due" file about once every 20 hours
+          [ -f backup_due ] || { echo "No backup due this run"; exit 0; }
           git config user.name "threat-intel-monitor[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add seen.json
           if git diff --cached --quiet; then
             echo "Nothing new to back up"
-          else
-            git commit -m "Daily backup of seen items"
-            git pull --rebase --quiet || true
-            git push
+            exit 0
           fi
+          git commit -q -m "Daily backup of seen items"
+          git push -q || { git pull -q --rebase --depth=1 && git push -q; } || echo "Backup push failed; will try again tomorrow"
+
+      - name: Warn on Telegram if this run failed
+        # Sends at most about one warning an hour (only from runs in the first 20 minutes of the hour)
+        if: failure() || cancelled()
+        env:
+          TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          MANUAL: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          [ -n "$TOKEN" ] || exit 0
+          if [ "$MANUAL" != "true" ] && [ "$(date -u +%M)" -ge 20 ]; then
+            echo "A warning was already sent this hour"; exit 0
+          fi
+          curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${CHAT}" \
+            --data-urlencode "text=⚠️ Threat Intel Monitor: a run failed or was cut short, so alerts may be delayed. Details: ${RUN_URL}" \
+            > /dev/null || true
