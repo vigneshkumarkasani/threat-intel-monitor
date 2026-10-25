@@ -2,8 +2,8 @@ name: Threat Intel Monitor
 
 on:
   schedule:
-    - cron: "*/20 * * * *"  # every 20 minutes (backup to cron-job.org); busy times can delay a run
-  workflow_dispatch:        # adds a "Run workflow" button so you can test it any time
+    - cron: "7,27,47 * * * *"  # every 20 min, off the busy :00 mark (backup to cron-job.org); GitHub may still delay or skip runs
+  workflow_dispatch:           # adds a "Run workflow" button; cron-job.org also starts runs this way
     inputs:
       force_digest:
         description: "Send the daily digest now"
@@ -11,7 +11,7 @@ on:
         default: false
 
 permissions:
-  contents: write           # lets the job save a daily backup of seen.json to the repo
+  contents: write              # lets the job save the bot's memory and the dashboard data to branches
 
 concurrency:
   group: threat-intel-monitor
@@ -21,11 +21,39 @@ jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      REMOTE: https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
     steps:
       - name: Get the code
-        uses: actions/checkout@v5   # latest commit only: fast, and doesn't slow down as backups pile up
+        uses: actions/checkout@v5   # latest commit only: fast
 
+      # The bot's memory (seen.json) lives on its own branch, "bot-memory", which holds a single
+      # commit that is replaced at the end of every run. This is more reliable than GitHub's cache.
       - name: Load the bot's memory
+        id: memory
+        run: |
+          for attempt in 1 2 3; do
+            if git fetch -q --depth=1 "$REMOTE" bot-memory 2>/dev/null; then
+              git show FETCH_HEAD:seen.json > seen.json
+              echo "Memory loaded from the bot-memory branch"
+              echo "found=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            sleep 5
+          done
+          code=0
+          git ls-remote --exit-code --heads "$REMOTE" bot-memory > /dev/null 2>&1 || code=$?   # 2 = branch doesn't exist
+          if [ "$code" -eq 2 ]; then
+            echo "No bot-memory branch yet: this is the first run with branch memory"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          else
+            # The memory exists but couldn't be read. Running with old memory would repeat alerts, so stop.
+            echo "::error::Could not load the bot's memory; skipping this run to avoid repeat alerts"
+            exit 1
+          fi
+
+      - name: Bring over the memory from the old cache (first run only)
+        if: steps.memory.outputs.found == 'false'
         uses: actions/cache/restore@v4
         with:
           path: seen.json
@@ -33,7 +61,7 @@ jobs:
           restore-keys: state-
 
       - name: Run the monitor
-        timeout-minutes: 11         # stop the script itself in time for its memory to be saved below
+        timeout-minutes: 11         # stop the script in time for its memory to be saved below
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -46,15 +74,28 @@ jobs:
         run: python3 monitor.py      # the runner already has Python 3; the script needs nothing else
 
       - name: Save the bot's memory
-        if: always()                 # even if the run failed or was cut short, keep what it already sent
-        uses: actions/cache/save@v4
-        with:
-          path: seen.json
-          key: state-${{ github.run_id }}
+        # Runs even if the monitor failed or was cut short, so what it already sent is remembered.
+        # Skipped only when the memory couldn't be loaded (saving then would overwrite good memory).
+        if: always() && steps.memory.outcome == 'success'
+        run: |
+          [ -f seen.json ] || { echo "No memory file to save"; exit 0; }
+          dir=$(mktemp -d)
+          cp seen.json "$dir/"
+          cd "$dir"
+          git init -q -b bot-memory
+          git config user.name "threat-intel-monitor[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add seen.json
+          git commit -q -m "Bot memory"
+          for attempt in 1 2 3 4; do
+            git push -q --force "$REMOTE" bot-memory && { echo "Memory saved"; exit 0; }
+            echo "Save attempt $attempt failed, retrying"
+            sleep $((attempt * 5))
+          done
+          echo "::error::Could not save the bot's memory"
+          exit 1
 
       - name: Publish dashboard data
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           [ -f feed.json ] || { echo "No dashboard data this run"; exit 0; }
           dir=$(mktemp -d)
@@ -66,21 +107,7 @@ jobs:
           git add feed.json
           git commit -q -m "Dashboard data"
           # A single commit, replaced every run, so this branch never builds up history
-          git push -q --force "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" dashboard-data
-
-      - name: Daily backup to the repo
-        run: |
-          # monitor.py leaves a "backup_due" file about once every 20 hours
-          [ -f backup_due ] || { echo "No backup due this run"; exit 0; }
-          git config user.name "threat-intel-monitor[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add seen.json
-          if git diff --cached --quiet; then
-            echo "Nothing new to back up"
-            exit 0
-          fi
-          git commit -q -m "Daily backup of seen items"
-          git push -q || { git pull -q --rebase --depth=1 && git push -q; } || echo "Backup push failed; will try again tomorrow"
+          git push -q --force "$REMOTE" dashboard-data || echo "Dashboard data not published this run"
 
       - name: Warn on Telegram if this run failed
         # Sends at most about one warning an hour (only from runs in the first 20 minutes of the hour)
@@ -89,11 +116,10 @@ jobs:
           TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          MANUAL: ${{ github.event_name == 'workflow_dispatch' }}
         run: |
           [ -n "$TOKEN" ] || exit 0
-          if [ "$MANUAL" != "true" ] && [ "$(date -u +%M)" -ge 20 ]; then
-            echo "A warning was already sent this hour"; exit 0
+          if [ "$(date -u +%M)" -ge 20 ]; then
+            echo "Only one warning per hour is sent"; exit 0
           fi
           curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${CHAT}" \
