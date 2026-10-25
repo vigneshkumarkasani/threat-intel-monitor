@@ -43,6 +43,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -56,6 +57,14 @@ MAX_DIGEST_LOOKUPS = 40          # most CVEs to look up in NVD per digest
 FINDINGS_KEPT_DAYS = 7           # how long findings are kept for the digest
 ALERT_REPEAT_DAYS = 14           # don't re-alert the same CVE for the same reason
 NEARBY_SENTENCES = 2             # how far from a CVE mention to look for malware words
+FEED_TIMEOUT = 15                # seconds to wait on one feed before giving up on it
+FEED_WORKERS = 10                # feeds downloaded at the same time
+LINK_MEMORY_DAYS = 45            # how long article links are remembered (stops old stories coming back)
+NVD_BUDGET_ALERTS = 90           # seconds allowed for NVD lookups before instant alerts go out
+NVD_BUDGET_DIGEST = 120          # seconds allowed for NVD lookups for the digest
+OUTBOX_MAX_HOURS = 12            # undelivered messages are retried for this long
+SOCIAL_CUTOFF_MINUTES = 7        # skip optional sources if a run is already this slow
+BACKUP_EVERY_HOURS = 20          # how often seen.json is backed up to the repo
 
 # Words that mean "this is about malware or an attack campaign".
 MALWARE_WORDS = [
@@ -186,11 +195,26 @@ def load_state():
     return {}
 
 
+def link_memory(state):
+    """Article links seen so far, as {link: date first seen}. Older saves kept a plain list."""
+    mem = state.get("articles")
+    if isinstance(mem, list):
+        today = now_utc().date().isoformat()
+        mem = {link: today for link in mem}
+    elif not isinstance(mem, dict):
+        mem = {}
+    state["articles"] = mem
+    return mem
+
+
 def save_state(state):
-    state.pop("_seen_set", None)
     cutoff_findings = now_utc() - timedelta(days=FINDINGS_KEPT_DAYS)
     cutoff_alerts = now_utc() - timedelta(days=ALERT_REPEAT_DAYS)
-    state["articles"] = state.get("articles", [])[-6000:]
+    oldest = (now_utc() - timedelta(days=LINK_MEMORY_DAYS)).date().isoformat()
+    links = {k: v for k, v in link_memory(state).items() if v >= oldest}
+    if len(links) > 60000:  # safety cap; keeps the newest
+        links = dict(sorted(links.items(), key=lambda kv: kv[1])[-60000:])
+    state["articles"] = links
     state["findings"] = [f for f in state.get("findings", [])
                          if (parse_time(f.get("time")) or now_utc()) > cutoff_findings]
     state["alerted"] = {k: v for k, v in state.get("alerted", {}).items()
@@ -484,36 +508,46 @@ def record_item(state, source, source_type, title, link, body, run_id):
     return added
 
 
+def _download_feed(feed):
+    """Fetch and parse one feed. Never raises: returns (feed, items or None, error or None)."""
+    try:
+        return feed, parse_feed(fetch(feed["url"], timeout=FEED_TIMEOUT)), None
+    except Exception as err:  # any failure (timeouts, dropped connections, bad XML) skips just this feed
+        return feed, None, err
+
+
 def check_feeds(state, feeds, run_id):
-    seen = set(state.get("articles", []))
-    remembered = list(state.get("articles", []))
+    seen = link_memory(state)
+    today = now_utc().date().isoformat()
     feeds_read = set(state.get("feeds_read", []))
     reached = 0
 
-    for feed in feeds:
-        name, url, kind = feed["name"], feed["url"], feed.get("type", "news")
-        try:
-            items = parse_feed(fetch(url))
-        except (urllib.error.URLError, ET.ParseError, TimeoutError, OSError, ValueError) as err:
-            log(f"Could not read {name}: {err}")
+    # Download all feeds at once (a slow site no longer holds up the others), then process in order.
+    with ThreadPoolExecutor(max_workers=FEED_WORKERS) as pool:
+        results = list(pool.map(_download_feed, feeds))
+
+    for feed, items, err in results:
+        name, kind = feed["name"], feed.get("type", "news")
+        if err is not None:
+            log(f"Could not read {name}: {type(err).__name__}: {err}")
             continue
         reached += 1
         first_read = name not in feeds_read
         feeds_read.add(name)
         new_matches = 0
-
-        for title, link, body in items:
-            if not link or link in seen:
-                continue
-            seen.add(link)
-            remembered.append(link)
-            if first_read:
-                continue  # remember the backlog, don't report it
-            new_matches += record_item(state, name, kind, title, link, body, run_id)
+        try:
+            for title, link, body in items:
+                if not link or link in seen:
+                    continue
+                seen[link] = today
+                if first_read:
+                    continue  # remember the backlog, don't report it
+                new_matches += record_item(state, name, kind, title, link, body, run_id)
+        except Exception as err:  # a strange item shouldn't stop the other feeds
+            log(f"Error while processing {name}: {type(err).__name__}: {err}")
         note = " (first read: saved without alerts)" if first_read else ""
         log(f"{name}: {len(items)} items, {new_matches} new CVE matches{note}")
 
-    state["articles"] = remembered
     state["feeds_read"] = sorted(feeds_read)
     return reached
 
@@ -524,11 +558,10 @@ def check_feeds(state, feeds, run_id):
 
 def remember_post(state, link, source):
     """True if this post is new. The first time a source is read, only remember."""
-    seen = state.setdefault("_seen_set", set(state.get("articles", [])))
+    seen = link_memory(state)
     if link in seen:
         return False
-    seen.add(link)
-    state["articles"].append(link)
+    seen[link] = now_utc().date().isoformat()
     return source in state.get("feeds_read", [])
 
 
@@ -768,16 +801,31 @@ def write_dashboard(state, kev, sources_watched):
 # Enrichment: NVD (CVSS, product) and FIRST EPSS
 # ---------------------------------------------------------------------------
 
+NVD_LIMIT = {"until": 0.0, "fails": 0, "noted": False}
+
+
+def nvd_budget(seconds):
+    """Allow NVD lookups for this many seconds from now. After that, messages go out without CVSS."""
+    NVD_LIMIT.update(until=time.monotonic() + seconds, fails=0, noted=False)
+
+
 def nvd_lookup(state, cve, api_key):
     cache = state.setdefault("nvd_cache", {})
     cached = cache.get(cve)
     if cached and (now_utc() - (parse_time(cached.get("time")) or now_utc())).days < 3:
         return cached
+    if time.monotonic() > NVD_LIMIT["until"] or NVD_LIMIT["fails"] >= 3:
+        if not NVD_LIMIT["noted"]:
+            NVD_LIMIT["noted"] = True
+            why = "NVD is not responding" if NVD_LIMIT["fails"] >= 3 else "NVD time budget used up"
+            log(f"{why}: sending the remaining alerts without CVSS")
+        return cached or {}
     url = "https://services.nvd.nist.gov/rest/json/cves/2.0?cveId=" + urllib.parse.quote(cve)
     headers = {"apiKey": api_key} if api_key else {}
     info = {"time": now_utc().isoformat(timespec="seconds")}
     try:
-        data = json.loads(fetch(url, timeout=30, headers=headers))
+        data = json.loads(fetch(url, timeout=12, headers=headers))
+        NVD_LIMIT["fails"] = 0
         vulns = data.get("vulnerabilities", [])
         if vulns:
             c = vulns[0]["cve"]
@@ -790,11 +838,14 @@ def nvd_lookup(state, cve, api_key):
                     break
             desc = next((d["value"] for d in c.get("descriptions", []) if d.get("lang") == "en"), "")
             info["description"] = desc[:300]
-    except Exception as err:  # NVD is often slow; never let it break the digest
+    except Exception as err:  # NVD is often slow; never let it break the alerts
+        NVD_LIMIT["fails"] += 1
         log(f"NVD lookup failed for {cve}: {err}")
         return cached or {}
+    cache.pop(cve, None)  # re-insert so recently used entries are the last to be trimmed
     cache[cve] = info
-    time.sleep(0.7 if api_key else 6.5)  # NVD allows 5 requests per 30 s without a key
+    if time.monotonic() < NVD_LIMIT["until"]:
+        time.sleep(0.7 if api_key else 6.5)  # NVD allows 5 requests per 30 s without a key
     return info
 
 
@@ -803,7 +854,7 @@ def epss_lookup(cves):
     for i in range(0, len(cves), 50):
         batch = cves[i:i + 50]
         try:
-            data = json.loads(fetch("https://api.first.org/data/v1/epss?cve=" + ",".join(batch)))
+            data = json.loads(fetch("https://api.first.org/data/v1/epss?cve=" + ",".join(batch), timeout=15))
             for row in data.get("data", []):
                 scores[row["cve"].upper()] = float(row.get("epss", 0))
         except Exception as err:
@@ -851,52 +902,57 @@ def instant_alerts(state, kev, run_id, api_key=""):
     """Turn this run's new findings into Telegram messages (dicts with text and buttons)."""
     alerted = state.setdefault("alerted", {})
     fresh = [f for f in state["findings"] if f.get("run") == run_id]
+    # Messages still waiting in the outbox count as alerted, so they aren't planned twice.
+    known = dict(alerted)
+    for m in state.get("outbox", []):
+        for key, when in m.get("keys", []):
+            known.setdefault(key, when)
 
     # --- 1) decide what to alert on -------------------------------------------------
     # A CVE is alerted again only when its news gets more serious:
     # plain CVE -> exploited -> malware -> KEV. Ten copies of one story send one alert.
     best = {}
-    for key in alerted:
+    for key in known:
         cve, _, kind = key.partition("|")
         best[cve] = max(best.get(cve, -1), KIND_RANK.get(kind, 0))
-    planned = []  # (kind of message, [findings])
+    planned = []  # (kind of message, [findings], [(alerted key, time)] to record once delivered)
     for f in (x for x in fresh if x["kind"] == "kev"):
-        alerted[f"{f['cve']}|kev"] = f["time"]
+        known[f"{f['cve']}|kev"] = f["time"]
         best[f["cve"]] = KIND_RANK["kev"]
-        planned.append(("kev", [f]))
+        planned.append(("kev", [f], [(f"{f['cve']}|kev", f["time"])]))
     poc_by_link = {}
     for f in (x for x in fresh if x["kind"] == "poc"):
         key = f"{f['cve']}|poc"
-        if key in alerted:
+        if key in known:
             continue  # one exploit alert per CVE
-        alerted[key] = f["time"]
+        known[key] = f["time"]
         best[f["cve"]] = max(best.get(f["cve"], -1), 0)  # no separate "new CVE" card later
         poc_by_link.setdefault(f["link"], []).append(f)
-    planned += [("poc", group) for group in poc_by_link.values()]
+    planned += [("poc", group, [(f"{f['cve']}|poc", f["time"]) for f in group]) for group in poc_by_link.values()]
     by_article = {}
     for f in (x for x in fresh if x["kind"] not in ("kev", "poc")):
         by_article.setdefault(f["link"], []).append(f)
     for link, group in by_article.items():
         if group[0]["kind"] == "malware_news":
-            planned.append(("malware_news", group[:1]))
+            planned.append(("malware_news", group[:1], []))
             continue
-        new = []
+        new, keys = [], []
         for f in group:
             rank = KIND_RANK[f["kind"]]
             if rank > best.get(f["cve"], -1):
                 new.append(f)
                 best[f["cve"]] = rank
-                alerted[f"{f['cve']}|{f['kind']}"] = f["time"]
+                keys.append((f"{f['cve']}|{f['kind']}", f["time"]))
         if new:
-            planned.append(("article", new))
+            planned.append(("article", new, keys))
 
     # --- 2) look up CVSS and EPSS for the CVEs we're about to report -----------------
-    cves = sorted({f["cve"] for _, group in planned for f in group if f.get("cve")})
+    cves = sorted({f["cve"] for _, group, _ in planned for f in group if f.get("cve")})
     epss = epss_lookup(cves) if cves else {}
     info = {}
     for cve in cves[:MAX_ALERT_LOOKUPS]:
         info[cve] = nvd_lookup(state, cve, api_key)
-    for _, group in planned:  # keep the scores with the findings (used by the dashboard)
+    for _, group, _ in planned:  # keep the scores with the findings (used by the dashboard)
         for f in group:
             if f.get("cve"):
                 f["cvss"] = info.get(f["cve"], {}).get("cvss")
@@ -904,19 +960,20 @@ def instant_alerts(state, kev, run_id, api_key=""):
 
     # --- 3) write the messages ------------------------------------------------------
     messages = []
-    for kind, group in planned:
+    for kind, group, keys in planned:
         if kind == "kev":
-            messages.append(render_kev(group[0], kev, info, epss))
+            msg = render_kev(group[0], kev, info, epss)
         elif kind == "malware_news":
-            messages.append(render_malware_news(group[0]))
+            msg = render_malware_news(group[0])
         elif kind == "poc":
-            messages.append(render_poc(group, kev, info, epss))
+            msg = render_poc(group, kev, info, epss)
         else:
             top = max(KIND_RANK[f["kind"]] for f in group)
-            if top == KIND_RANK["cve"]:
-                messages.append(render_card(group, kev, info, epss))
-            else:
-                messages.append(render_detailed(group, top, kev, info, epss))
+            msg = (render_card(group, kev, info, epss) if top == KIND_RANK["cve"]
+                   else render_detailed(group, top, kev, info, epss))
+        msg = dict(msg) if isinstance(msg, dict) else {"text": msg}
+        msg["keys"] = [list(k) for k in keys]
+        messages.append(msg)
     return messages
 
 
@@ -1241,21 +1298,35 @@ def main():
         state["last_digest"] = now_utc().astimezone(IST).date().isoformat()
         state["last_digest_time"] = now_utc().isoformat(timespec="seconds")
 
-    kev = {}
-    try:
-        kev = check_kev(state, config["kev_url"], run_id)
-    except Exception as err:  # one broken source shouldn't stop the others
-        log(f"KEV check failed: {err}")
-    reached = check_feeds(state, config["feeds"], run_id)
-    check_bluesky(state, config, run_id)
-    check_x(state, config, run_id)
-    check_github(state, config, run_id)
+    started = time.monotonic()
 
+    def safely(name, fn, *args, default=None):
+        """Run one source; if it fails for any reason, log it and carry on with the rest."""
+        try:
+            return fn(*args)
+        except Exception as err:
+            log(f"{name} failed: {type(err).__name__}: {err}")
+            return default
+
+    kev = safely("KEV check", check_kev, state, config["kev_url"], run_id, default={}) or {}
+    reached = safely("Feeds", check_feeds, state, config["feeds"], run_id, default=0) or 0
+    if time.monotonic() - started < SOCIAL_CUTOFF_MINUTES * 60:
+        safely("Bluesky", check_bluesky, state, config, run_id)
+        safely("X", check_x, state, config, run_id)
+        safely("GitHub", check_github, state, config, run_id)
+    else:
+        log("This run is already slow: skipping Bluesky, X and GitHub until the next run")
+
+    nvd_budget(NVD_BUDGET_ALERTS)
     messages = instant_alerts(state, kev, run_id, nvd_key)
     if len(messages) > MAX_INSTANT_ALERTS_PER_RUN:
-        extra = len(messages) - MAX_INSTANT_ALERTS_PER_RUN
+        extra = messages[MAX_INSTANT_ALERTS_PER_RUN:]
         messages = messages[:MAX_INSTANT_ALERTS_PER_RUN]
-        messages.append(f"…and {extra} more new items this run. They'll all be in the daily digest.")
+        alerted = state.setdefault("alerted", {})
+        for m in extra:  # these are covered by the daily digest instead
+            for key, when in m.get("keys", []):
+                alerted[key] = when
+        messages.append(f"…and {len(extra)} more new items this run. They'll all be in the daily digest.")
 
     if brand_new:
         messages = [
@@ -1267,20 +1338,54 @@ def main():
     elif digest_due(state):
         since = parse_time(state.get("last_digest_time")) or (now_utc() - timedelta(days=1))
         since = max(since, now_utc() - timedelta(days=1, hours=2))
+        nvd_budget(NVD_BUDGET_DIGEST)
         messages += build_digest(state, kev, since, nvd_key)
         state["last_digest"] = now_utc().astimezone(IST).date().isoformat()
         state["last_digest_time"] = now_utc().isoformat(timespec="seconds")
 
-    sent = 0
-    for message in messages:
-        text, buttons = (message["text"], message.get("buttons")) if isinstance(message, dict) else (message, None)
+    # Delivery. Every message goes through the outbox, which is saved before sending and after each
+    # message, so a run that is cut short neither loses alerts nor sends them twice. A CVE only counts
+    # as "alerted" once Telegram has accepted the message; failed messages are retried next run.
+    now_iso = now_utc().isoformat(timespec="seconds")
+    queue = []
+    for m in state.get("outbox", []):
+        age = now_utc() - (parse_time(m.get("queued")) or now_utc())
+        if age > timedelta(hours=OUTBOX_MAX_HOURS):
+            log("Dropping an undelivered message older than "
+                f"{OUTBOX_MAX_HOURS} h (its finding is still in the digest)")
+            continue
+        queue.append(m)
+    for m in messages:
+        m = dict(m) if isinstance(m, dict) else {"text": m}
+        m.setdefault("keys", [])
+        m["queued"] = now_iso
+        queue.append(m)
+
+    state["outbox"] = list(queue)
+    if not dry_run:
+        save_state(state)
+    sent, failed = 0, []
+    for i, m in enumerate(queue):
         if dry_run:
-            print("\n" + "-" * 60 + "\n" + text)
-            if buttons:
-                print("   " + "  ".join(f"[ {label} ]" for label, _ in buttons))
-        elif send_telegram(token, chat_id, text, buttons):
+            print("\n" + "-" * 60 + "\n" + m["text"])
+            if m.get("buttons"):
+                print("   " + "  ".join(f"[ {label} ]" for label, _ in m["buttons"]))
+            ok = True
+        else:
+            ok = send_telegram(token, chat_id, m["text"], m.get("buttons"))
+        if ok:
             sent += 1
-            time.sleep(1)
+            for key, when in m.get("keys", []):  # save_state() rebuilds this dict, so look it up each time
+                state.setdefault("alerted", {})[key] = when
+        else:
+            failed.append(m)
+        state["outbox"] = failed + queue[i + 1:]
+        if not dry_run:
+            save_state(state)
+            if ok and i + 1 < len(queue):
+                time.sleep(1)
+    if failed:
+        log(f"{len(failed)} message(s) could not be delivered; they will be retried next run")
 
     sources_watched = (1 + len(config["feeds"]) + len(config.get("github", {}).get("commit_repos", []))
                        + (1 if config.get("github", {}).get("poc_queries") else 0)
@@ -1291,8 +1396,15 @@ def main():
         write_dashboard(state, kev, sources_watched)
     except Exception as err:  # the dashboard is a nice-to-have; never let it stop alerts
         log(f"Dashboard data not written: {err}")
+
+    # Ask the workflow to back up seen.json to the repo about once a day.
+    last_backup = parse_time(state.get("last_backup"))
+    if not last_backup or now_utc() - last_backup > timedelta(hours=BACKUP_EVERY_HOURS):
+        state["last_backup"] = now_utc().isoformat(timespec="seconds")
+        (HERE / "backup_due").write_text("1", encoding="utf-8")
     save_state(state)
-    log(f"Done. {reached}/{len(config['feeds'])} feeds read, {len(messages)} messages, {sent} sent.")
+    log(f"Done in {time.monotonic() - started:.0f} s. {reached}/{len(config['feeds'])} feeds read, "
+        f"{len(queue)} messages, {sent} sent, {len(failed)} waiting.")
 
 
 if __name__ == "__main__":

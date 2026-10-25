@@ -4,7 +4,6 @@ A personal early-warning feed for vulnerability intelligence. Every 20 minutes i
 
 - a **new CVE** appears in any news, research, vendor or government source,
 - a CVE is reported **exploited**, or **linked to malware**,
-- a **public exploit** appears (Exploit-DB, Metasploit, Nuclei templates, GitHub PoC repositories),
 - a **malware article** is published, even with no CVE, or
 - CISA adds a CVE to the **KEV catalog**.
 
@@ -19,11 +18,10 @@ A daily digest at 9:00 AM IST ranks the last 24 hours by urgency, and a live das
 | Threat research | Google Threat Intelligence (Mandiant), Unit 42, Rapid7, watchTowr Labs, Cisco Talos, Microsoft Security Blog, Kaspersky Securelist, Check Point Research, Huntress, SANS ISC, AWS Security Blog, Sophos |
 | Vendor advisories | Cisco, Fortinet PSIRT, Palo Alto Networks, Google Chrome Releases, Oracle, GitHub Advisory Database (critical and high) |
 | Government | Canadian Centre for Cyber Security (advisories for most major vendors), CERT-EU |
-| Exploits and PoCs | Exploit-DB, Metasploit modules, Nuclei templates, new GitHub repositories named after a CVE |
 | Social | Mastodon (#cve, #zeroday, #ransomware, #malware, #threatintel), Bluesky; optional X/Twitter (paid) |
 | Enrichment | NVD (CVSS, description), FIRST EPSS (exploit probability) |
 
-Feeds are listed in `sources.json`. To add one, copy a line and change the name, type and URL. The GitHub sources use GitHub's official API with the token Actions provides automatically.
+Feeds are listed in `sources.json`. To add one, copy a line and change the name, type and URL. PoC and public-exploit sources are switched off. The GitHub advisory database uses GitHub's official API with the token Actions provides automatically.
 
 ## Alerts
 
@@ -33,13 +31,12 @@ Feeds are listed in `sources.json`. To add one, copy a line and change the name,
 | 🦠 Malware linked to CVE | Detailed | A CVE mentioned alongside malware or a named family (Qilin, XMRig, Cobalt Strike…) |
 | 🛑 Vendor / government confirms exploitation | Detailed | An official advisory says it is exploited |
 | ⚠️ Exploitation reported | Detailed | News, research or social posts report in-the-wild exploitation |
-| 💥 Public exploit available | Detailed | An exploit, PoC, Metasploit module or Nuclei template appeared. GitHub PoCs carry a warning: fake PoCs that hide malware are common |
 | 🧬 Malware activity, no CVE | Threat profile | Family, type (ransomware, infostealer, botnet…), delivery method (phishing, ClickFix, malicious packages…) |
 | 🆕 New CVE | Card | First time a CVE appears in any source |
 
 Every CVE alert includes CVSS with severity, EPSS, KEV status, a short summary, the time in IST and buttons to the article and NVD.
 
-A CVE is alerted again only when its news gets more serious: new CVE, then exploited, then malware, then KEV. Public exploits are alerted once per CVE. When ten sites copy one story, you get one alert. Social media alerts only on exploitation or malware, because bots there announce every CVE.
+A CVE is alerted again only when its news gets more serious: new CVE, then exploited, then malware, then KEV. When ten sites copy one story, you get one alert. Social media alerts only on exploitation or malware, because bots there announce every CVE.
 
 ## Accuracy rules
 
@@ -48,7 +45,6 @@ Malware and exploitation words only count within a couple of sentences of the CV
 - **Denials:** "no evidence it was exploited", "not in the KEV catalog"
 - **Hypotheticals:** "could allow an attacker to install malware"
 - **Related-story links:** an unrelated ransomware headline lower on the page
-- **CVE collections:** GitHub repositories listing more than three CVEs
 
 ## Live dashboard
 
@@ -74,9 +70,19 @@ Run it once from **Actions → Threat Intel Monitor → Run workflow**. Tick **S
 ## How it runs
 
 - **Schedule:** cron-job.org starts the workflow every 20 minutes through GitHub's API. GitHub's own schedule is kept as a backup. The workflow's concurrency setting stops runs from overlapping.
-- **Memory:** `seen.json` is kept in GitHub's cache between runs and backed up to the repo once a day.
+- **Memory:** `seen.json` is kept in GitHub's cache between runs and backed up to the repo about once a day.
 - **First read:** the first time a source is read, its existing items are saved without alerting, so there's no flood of old stories.
-- **Testing:** run `python monitor.py` without secrets to print messages instead of sending them.
+- **Testing:** run `python3 monitor.py` without secrets to print messages instead of sending them.
+
+## Reliability
+
+- **Feeds are downloaded in parallel** with a 15-second limit each, so a slow site can't hold up the run. Any error from one feed (timeouts, dropped connections, broken XML) skips just that feed.
+- **Every source is isolated.** If KEV, a feed, Bluesky, X or GitHub fails, the others still run. Optional sources are skipped if a run is already slow.
+- **NVD has a time budget** (90 seconds for instant alerts, 120 for the digest) and is skipped after three failures in a row. When NVD is down, alerts still go out, just without CVSS.
+- **Nothing is marked as alerted until Telegram accepts the message.** Undelivered messages wait in an outbox inside `seen.json` and are retried on later runs for up to 12 hours. The outbox is saved before and after each message, so a run that's cut short neither loses alerts nor sends them twice.
+- **Article links are remembered for 45 days by date**, so old stories in slow-moving feeds never come back as new.
+- **Memory is always saved**, even when a run fails or times out. The script stops at 11 minutes so there's time to save.
+- **You're told when something breaks:** a failed or cut-short run sends a short Telegram warning (at most about one an hour) with a link to the run.
 
 ## Files
 
@@ -86,4 +92,4 @@ Run it once from **Actions → Threat Intel Monitor → Run workflow**. Tick **S
 | `sources.json` | Feeds, GitHub and social media settings |
 | `malware_names.txt` | Malware families and groups to recognise |
 | `.github/workflows/monitor.yml` | Schedule, memory, dashboard publishing and daily backup |
-| `seen.json` | Created automatically: what has been reported |
+| `seen.json` | Created automatically: what has been reported, plus any messages waiting to be delivered |
