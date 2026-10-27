@@ -4,19 +4,25 @@ Threat Intel Monitor
 Watches news sites, research blogs, vendor advisories, CISA and social media
 for new CVEs and malware, and reports them on Telegram within minutes:
 
-  * INSTANT ALERTS (every run, every 5 minutes on GitHub Actions)
+  * INSTANT ALERTS (every run, about every 20 minutes on GitHub Actions)
       🔴 a CVE newly added to CISA's Known Exploited Vulnerabilities catalog
       🦠 a CVE linked to malware or a named malware family
       🛑 / ⚠️ a CVE reported as exploited (by a vendor, or in news/research)
       🆕 the first time a CVE appears in any news, research or vendor source
       🧬 a malware article, even if it names no CVE
-      💥 a public exploit, PoC, Metasploit module or Nuclei template for a CVE
     A CVE is alerted again only when its news gets more serious
     (new CVE -> exploited -> malware -> KEV), so one story copied by ten
     sites sends one alert. Social posts alert only on exploitation/malware.
   * DAILY DIGEST (once a day, at DIGEST_TIME_IST)
       everything from the last 24 hours, grouped by CVE, with CVSS, EPSS,
       KEV status, named malware and how many sources reported it
+  * WEEKLY REPORT (Mondays at WEEKLY_TIME_IST)
+      the week's totals against last week, the most-exploited vendors, top
+      malware families, and how often news or vendors beat CISA's KEV listing
+  * WATCHLIST AND GROUPING (both set in sources.json)
+      a CVE that mentions a watched product is tagged 👀 in its alert and in the
+      digest; when one run brings several plain "new CVE" cards for the same
+      vendor, they are folded into a single message
 
 Sources live in sources.json and malware names in malware_names.txt.
 What has already been seen is remembered in seen.json.
@@ -27,6 +33,7 @@ Settings come from environment variables (GitHub "secrets"):
   BLUESKY_HANDLE, BLUESKY_APP_PASSWORD   optional, turns on Bluesky search (free)
   X_BEARER_TOKEN                         optional, turns on X/Twitter search (paid)
   FORCE_DIGEST                           "true" sends the digest right now
+  FORCE_WEEKLY                           "true" sends the weekly report right now
 Without the Telegram settings the script runs in DRY-RUN mode and prints
 the messages instead of sending them.
 
@@ -37,6 +44,7 @@ import html
 import json
 import os
 import re
+import statistics
 import sys
 import time
 import urllib.error
@@ -52,9 +60,12 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 DIGEST_TIME_IST = "09:00"        # when the daily digest is sent (India time)
+WEEKLY_DAY_IST = 0               # weekday of the weekly report (0 = Monday)
+WEEKLY_TIME_IST = "09:30"        # when the weekly report is sent (India time)
 MAX_INSTANT_ALERTS_PER_RUN = 30  # stops a flood of messages on a busy day
 MAX_DIGEST_LOOKUPS = 40          # most CVEs to look up in NVD per digest
-FINDINGS_KEPT_DAYS = 7           # how long findings are kept for the digest
+DIGEST_SUMMARY_CHARS = 320       # longest summary shown under each CVE in the daily digest
+FINDINGS_KEPT_DAYS = 8           # how long findings are kept (digest and weekly report)
 ALERT_REPEAT_DAYS = 14           # don't re-alert the same CVE for the same reason
 NEARBY_SENTENCES = 2             # how far from a CVE mention to look for malware words
 FEED_TIMEOUT = 15                # seconds to wait on one feed before giving up on it
@@ -183,6 +194,48 @@ def parse_time(value):
 
 
 # ---------------------------------------------------------------------------
+# Products: vendor detection and the watchlist (both configured in sources.json)
+# ---------------------------------------------------------------------------
+
+SETTINGS = {"group_min": 3, "mute_others": False}
+VENDOR_OF = {}                  # lowercase alias -> vendor name
+VENDOR_RE = phrase_regex([])
+WATCH_OF = {}                   # lowercase watchlist term -> term as written in sources.json
+WATCH_RE = phrase_regex([])
+
+
+def configure_products(config):
+    """Read the vendor list, the watchlist and the grouping settings from sources.json."""
+    global VENDOR_RE, WATCH_RE
+    VENDOR_OF.clear()
+    WATCH_OF.clear()
+    for name, aliases in (config.get("vendors") or {}).items():
+        if name.startswith("_"):
+            continue
+        for alias in [name] + list(aliases or []):
+            VENDOR_OF[alias.lower()] = name
+    VENDOR_RE = phrase_regex(list(VENDOR_OF))
+    watch = config.get("watchlist") or {}
+    for term in watch.get("terms", []):
+        WATCH_OF[term.lower()] = term
+    WATCH_RE = phrase_regex(list(WATCH_OF))
+    SETTINGS["mute_others"] = bool(watch.get("mute_other_new_cves", False))
+    SETTINGS["group_min"] = int((config.get("grouping") or {}).get("min_alerts_per_vendor", 3))
+
+
+def detect_vendor(*texts):
+    """The vendor named earliest in the text, or None."""
+    m = VENDOR_RE.search(" | ".join(t for t in texts if t))
+    return VENDOR_OF.get(m.group(0).lower()) if m else None
+
+
+def watch_terms(*texts):
+    """Which watchlist terms appear in the text (as written in sources.json)."""
+    found = WATCH_RE.findall(" | ".join(t for t in texts if t))
+    return sorted({WATCH_OF.get(m.lower(), m) for m in found})[:6]
+
+
+# ---------------------------------------------------------------------------
 # Saved state (seen.json)
 # ---------------------------------------------------------------------------
 
@@ -245,8 +298,13 @@ def check_kev(state, kev_url, run_id):
     new_ids = sorted((c for c in kev if c not in seen), key=lambda c: kev[c].get("dateAdded", ""))
     for cve in new_ids:
         e = kev[cve]
+        vendor = (detect_vendor(e.get("vendorProject"), e.get("product"))
+                  or (e.get("vendorProject") or "").strip() or None)
+        watch = watch_terms(e.get("vendorProject"), e.get("product"),
+                            e.get("vulnerabilityName"), e.get("shortDescription"))
         state["findings"].append({
             "cve": cve, "kind": "kev", "source": "CISA KEV", "source_type": "government",
+            "vendor": vendor, "watch": watch,
             "title": e.get("vulnerabilityName", ""),
             "link": nvd_link(cve), "malware": [], "terms": [],
             "ransomware": e.get("knownRansomwareCampaignUse", "Unknown").lower() == "known",
@@ -481,6 +539,8 @@ def record_item(state, source, source_type, title, link, body, run_id):
     added = 0
     summary = make_summary(title, body)
     results = analyse_article(title, body)
+    vendor = detect_vendor(title) or detect_vendor(summary)
+    watch = watch_terms(title, summary)
     for cve, r in results.items():
         kind = "poc" if source_type == "exploit" else classify(r)
         if social and kind == "cve":
@@ -489,6 +549,7 @@ def record_item(state, source, source_type, title, link, body, run_id):
             "cve": cve, "kind": kind, "source": source, "source_type": source_type,
             "title": title, "link": link,
             "malware": sorted(r["names"]), "terms": sorted(r["malware"] | r["terms"]),
+            "vendor": vendor, "watch": watch,
             "summary": summary,
             "time": now_utc().isoformat(timespec="seconds"), "run": run_id,
         })
@@ -957,6 +1018,10 @@ def instant_alerts(state, kev, run_id, api_key=""):
             if f.get("cve"):
                 f["cvss"] = info.get(f["cve"], {}).get("cvss")
                 f["epss"] = epss.get(f["cve"])
+                desc = info.get(f["cve"], {}).get("description", "")
+                f["vendor"] = f.get("vendor") or detect_vendor(desc)
+                f["watch"] = sorted(set(f.get("watch", [])) | set(watch_terms(desc)))
+    planned = group_by_vendor(planned)
 
     # --- 3) write the messages ------------------------------------------------------
     messages = []
@@ -967,14 +1032,87 @@ def instant_alerts(state, kev, run_id, api_key=""):
             msg = render_malware_news(group[0])
         elif kind == "poc":
             msg = render_poc(group, kev, info, epss)
+        elif kind == "vendor_group":
+            msg = render_vendor_group(group, kev, info, epss)
         else:
             top = max(KIND_RANK[f["kind"]] for f in group)
             msg = (render_card(group, kev, info, epss) if top == KIND_RANK["cve"]
                    else render_detailed(group, top, kev, info, epss))
         msg = dict(msg) if isinstance(msg, dict) else {"text": msg}
         msg["keys"] = [list(k) for k in keys]
+        hits = sorted({t for f in group for t in f.get("watch", [])})
+        if hits:  # a watched product: tag it (and keep the sound on)
+            msg["text"] = f"👀 <b>WATCHLIST: {esc(', '.join(hits[:4]))}</b>\n" + msg["text"]
+        elif (SETTINGS["mute_others"] and kind in ("article", "vendor_group")
+              and max(KIND_RANK[f["kind"]] for f in group) == KIND_RANK["cve"]):
+            msg["silent"] = True  # plain new-CVE card for something not on the watchlist
         messages.append(msg)
     return messages
+
+
+def group_by_vendor(planned):
+    """Fold several plain 'new CVE' cards for one vendor into a single message."""
+    need = SETTINGS["group_min"]
+    if need < 2:
+        return planned
+    buckets = {}
+    for i, (kind, group, _) in enumerate(planned):
+        if kind != "article" or any(f.get("watch") for f in group):
+            continue  # exploited / malware / watchlist alerts always stay on their own
+        if max(KIND_RANK[f["kind"]] for f in group) != KIND_RANK["cve"]:
+            continue
+        vendor = next((f["vendor"] for f in group if f.get("vendor")), None)
+        if vendor:
+            buckets.setdefault(vendor, []).append(i)
+    first_of, dropped = {}, set()
+    for vendor, idx in buckets.items():
+        if len(idx) >= need:
+            first_of[idx[0]] = (vendor, idx)
+            dropped.update(idx[1:])
+    if not first_of:
+        return planned
+    out = []
+    for i, entry in enumerate(planned):
+        if i in dropped:
+            continue
+        if i in first_of:
+            vendor, idx = first_of[i]
+            merged, keys = [], []
+            for j in idx:
+                merged += planned[j][1]
+                keys += planned[j][2]
+            for f in merged:
+                f["vendor"] = f.get("vendor") or vendor
+            out.append(("vendor_group", merged, keys))
+        else:
+            out.append(entry)
+    return out
+
+
+def render_vendor_group(group, kev, info, epss):
+    """One message listing the new CVEs several reports brought for the same vendor."""
+    vendor = next((f["vendor"] for f in group if f.get("vendor")), "Various vendors")
+    rows = {}
+    for f in group:
+        rows.setdefault(f["cve"], f)
+    cves = sorted(rows, key=lambda c: -(info.get(c, {}).get("cvss") or 0))
+    reports = len({f["link"] for f in group})
+    scores = [info.get(c, {}).get("cvss") for c in cves]
+    sev = severity_of(max((x for x in scores if x is not None), default=None))
+    head = f"🗂 <b>NEW CVEs · {esc(vendor)}</b>" + (f" · {SEVERITY_ICON.get(sev, '')} <b>{sev.upper()}</b>" if sev else "")
+    lines = [head, DIVIDER,
+             f"<b>{len(cves)} CVEs</b> from {reports} report{'s' if reports != 1 else ''}", ""]
+    for c in cves[:12]:
+        f = rows[c]
+        title = f["title"] if len(f["title"]) <= 90 else f["title"][:87].rsplit(" ", 1)[0] + "…"
+        ref = (f'<a href="{html.escape(f["link"], quote=True)}">{esc(title)}</a>'
+               if f["link"].startswith("http") else esc(title))
+        lines.append(f"• {cve_link(c)}  {esc(score_line(c, info.get(c, {}), epss, kev))}")
+        lines.append(f"   {ref} · {esc(f['source'])}")
+    if len(cves) > 12:
+        lines.append(f"…and {len(cves) - 12} more (all of them are in the daily digest)")
+    lines += ["", f"🕒 {found_time(group[0])}"]
+    return {"text": "\n".join(lines), "buttons": []}
 
 
 def article_buttons(link, cves, kev, source_type="news"):
@@ -1136,13 +1274,20 @@ def build_digest(state, kev, since, api_key):
     by_cve = {}
     for f in recent:
         c = by_cve.setdefault(f["cve"], {"kinds": set(), "sources": {}, "malware": set(),
-                                         "confirmed": False, "ransomware": False})
+                                         "confirmed": False, "ransomware": False, "watch": set()})
         c["kinds"].add(f["kind"])
+        c["watch"] |= set(f.get("watch", []))
         c["sources"].setdefault(f["source"], f["link"])
         c["malware"] |= set(f.get("malware", []))
         c["confirmed"] |= ((f["source_type"] in CONFIRMED_TYPES and f["kind"] in ("exploited", "malware"))
                            or f["kind"] == "kev")
         c["ransomware"] |= bool(f.get("ransomware"))
+        # Summary to show: CISA's own text first, then vendor / government advisories, then news.
+        text = (f.get("summary") or "").strip()
+        if text and text.lower().rstrip("….") != (f.get("title") or "").lower().rstrip("….") and f["kind"] != "poc":
+            pref = 0 if f["kind"] == "kev" else 1 if f["source_type"] in CONFIRMED_TYPES else 2
+            if pref < c.get("summary_pref", 9):
+                c["summary"], c["summary_pref"] = text, pref
 
     for cve, c in by_cve.items():
         c["in_kev"] = cve in kev
@@ -1153,7 +1298,8 @@ def build_digest(state, kev, since, api_key):
 
     def rank(item):
         cve, c = item
-        return (c["in_kev"], c["confirmed"], "poc" in c["kinds"], len(c["sources"]), epss.get(cve, 0))
+        return (bool(c["watch"]), c["in_kev"], c["confirmed"], "poc" in c["kinds"],
+                len(c["sources"]), epss.get(cve, 0))
 
     ordered = sorted(by_cve.items(), key=rank, reverse=True)
     for cve, _ in ordered[:MAX_DIGEST_LOOKUPS]:
@@ -1175,7 +1321,7 @@ def build_digest(state, kev, since, api_key):
             bits.append("ransomware use")
         if "poc" in c["kinds"]:
             bits.append("public exploit")
-        line = f"• {cve_link(cve)}"
+        line = f"• {'👀 ' if c['watch'] else ''}{cve_link(cve)}"
         if product:
             line += f" · {esc(product)}"
         line += f"\n   {esc(' · '.join(bits))}"
@@ -1185,9 +1331,11 @@ def build_digest(state, kev, since, api_key):
         refs = ", ".join(f'<a href="{html.escape(u, quote=True)}">{esc(s)}</a>' for s, u in sources[:3])
         more = f" +{len(sources) - 3} more" if len(sources) > 3 else ""
         line += f"\n   {len(sources)} source{'s' if len(sources) != 1 else ''}: {refs}{more}"
-        if not product and nvd.get("description"):
-            d = nvd["description"]
-            line += "\n   " + esc(d if len(d) <= 160 else d[:157].rsplit(" ", 1)[0] + "…")
+        summary = c.get("summary") or nvd.get("description") or ""
+        if summary:
+            summary = summary if len(summary) <= DIGEST_SUMMARY_CHARS else \
+                summary[:DIGEST_SUMMARY_CHARS - 1].rsplit(" ", 1)[0] + "…"
+            line += f"\n   📝 <i>{esc(summary)}</i>"
         return line
 
     sections = [
@@ -1205,7 +1353,8 @@ def build_digest(state, kev, since, api_key):
     sources_count = len({f["source"] for f in recent + news_only})
     header = (f"📋 <b>Daily threat digest · {now_utc().astimezone(IST):%d %b %Y}</b>\n"
               f"{len(by_cve)} CVEs and {len(news_only)} malware stories from {sources_count} sources "
-              "in the last 24 hours. Most urgent first.")
+              "in the last 24 hours, including ones you were already alerted about. Most urgent first, "
+              "each with a short summary.")
     pieces = [header]
     for title, items in sections:
         if items:
@@ -1230,6 +1379,147 @@ def build_digest(state, kev, since, api_key):
     return messages
 
 
+def fmt_span(seconds):
+    if seconds < 3600:
+        return f"{max(1, round(seconds / 60))} min"
+    if seconds < 48 * 3600:
+        return f"{seconds / 3600:.0f} h"
+    return f"{seconds / 86400:.1f} days"
+
+
+def build_weekly(state, kev):
+    """Totals against last week, top vendors and malware families, and news versus CISA KEV timing."""
+    now = now_utc()
+    start = now - timedelta(days=7)
+    today = now.astimezone(IST).date()
+    head = f"📊 <b>Weekly threat report · {today - timedelta(days=6):%d %b} – {today:%d %b %Y}</b>"
+    week = [f for f in state.get("findings", []) if (parse_time(f.get("time")) or start) >= start]
+    if not week:
+        return [head + "\nNothing was recorded this week."]
+
+    by_cve = {}
+    for f in week:
+        if f.get("cve"):
+            by_cve.setdefault(f["cve"], []).append(f)
+
+    def top_rank(fs):
+        return max(KIND_RANK.get(f["kind"], 0) for f in fs)
+
+    totals = {
+        "cves": len(by_cve),
+        "exploited": sum(1 for fs in by_cve.values() if top_rank(fs) >= KIND_RANK["exploited"]),
+        "malware": sum(1 for fs in by_cve.values() if any(f["kind"] == "malware" or f.get("malware") for f in fs)),
+        "kev": sum(1 for fs in by_cve.values() if any(f["kind"] == "kev" for f in fs)),
+        "stories": len({f["link"] for f in week if f["kind"] == "malware_news"}),
+    }
+    prev = state.get("weekly_prev") or {}
+
+    def vs(key):
+        if key not in prev:
+            return ""
+        d = totals[key] - prev[key]
+        return " (same as last week)" if d == 0 else f" ({'▲' if d > 0 else '▼'} {abs(d)} vs last week)"
+
+    lines = [head, DIVIDER, "<b>This week</b>",
+             f"🆕 CVEs seen: <b>{totals['cves']}</b>{vs('cves')}",
+             f"⚠️ Reported exploited or worse: <b>{totals['exploited']}</b>{vs('exploited')}",
+             f"🦠 Linked to malware: <b>{totals['malware']}</b>{vs('malware')}",
+             f"🔴 Added to CISA KEV: <b>{totals['kev']}</b>{vs('kev')}",
+             f"🧬 Malware stories without a CVE: <b>{totals['stories']}</b>{vs('stories')}"]
+
+    # Vendors with the most exploited CVEs (the vendor from CISA's own entry wins)
+    vendor_cves, unknown = {}, 0
+    for cve, fs in by_cve.items():
+        if top_rank(fs) < KIND_RANK["exploited"]:
+            continue
+        vendor = next((f["vendor"] for f in sorted(fs, key=lambda f: f["kind"] != "kev")
+                       if f.get("vendor")), None)
+        if vendor:
+            vendor_cves.setdefault(vendor, set()).add(cve)
+        else:
+            unknown += 1
+    top_vendors = sorted(vendor_cves.items(), key=lambda kv: (-len(kv[1]), kv[0]))[:5]
+    if top_vendors:
+        lines += ["", "🏢 <b>Most exploited vendors</b>"]
+        for i, (vendor, cves) in enumerate(top_vendors, 1):
+            lines.append(f"{i}. {esc(vendor)} · {len(cves)} CVE{'s' if len(cves) != 1 else ''}")
+        if unknown:
+            lines.append(f"<i>plus {unknown} exploited CVE{'s' if unknown != 1 else ''} with no vendor identified</i>")
+
+    families = {}
+    for f in week:
+        for name in f.get("malware", []):
+            families.setdefault(name, set()).add(f.get("cve") or f["link"])
+    top_families = sorted(families.items(), key=lambda kv: (-len(kv[1]), kv[0]))[:5]
+    if top_families:
+        lines += ["", "🦠 <b>Top malware families</b>"]
+        for i, (name, items) in enumerate(top_families, 1):
+            lines.append(f"{i}. {esc(name)} · {len(items)} report{'s' if len(items) != 1 else ''}")
+
+    # News versus CISA KEV: how often was a CVE reported before CISA listed it?
+    kev_total, leads = 0, []
+    for cve, fs in by_cve.items():
+        kev_times = [t for t in (parse_time(f.get("time")) for f in fs if f["kind"] == "kev") if t]
+        if not kev_times:
+            continue
+        kev_total += 1
+        listed = min(kev_times)
+        earlier = [t for t in (parse_time(f.get("time")) for f in fs if f["kind"] != "kev") if t and t < listed]
+        if earlier:
+            leads.append(((listed - min(earlier)).total_seconds(), cve))
+    lines += ["", "⏱ <b>News versus CISA KEV</b>"]
+    if not kev_total:
+        lines.append("No new CISA KEV entries this week.")
+    elif not leads:
+        lines.append(f"{kev_total} CVE{'s' if kev_total != 1 else ''} hit KEV. "
+                     "None had been reported by our sources first.")
+    else:
+        typical = statistics.median(s for s, _ in leads)
+        longest = max(leads)
+        lines.append(f"{kev_total} CVE{'s' if kev_total != 1 else ''} hit KEV; {len(leads)} "
+                     f"{'was' if len(leads) == 1 else 'were'} already in the news or advisories first. "
+                     f"Typical head start {fmt_span(typical)}, longest {fmt_span(longest[0])} "
+                     f"({cve_link(longest[1])}).")
+
+    # New CVEs per day, by the day the bot first saw each one
+    first_day = {}
+    for cve, fs in by_cve.items():
+        times = [t for t in (parse_time(f.get("time")) for f in fs) if t]
+        if times:
+            first_day[cve] = min(times).astimezone(IST).date()
+    days = [today - timedelta(days=d) for d in range(6, -1, -1)]
+    counts = [sum(1 for d in first_day.values() if d == day) for day in days]
+    peak = max(counts) or 1
+    lines += ["", "📅 <b>New CVEs per day</b>"]
+    for day, n in zip(days, counts):
+        bar = "█" * (max(1, round(n / peak * 10)) if n else 0)
+        lines.append(f"<code>{day:%a} {bar:<10} {n}</code>")
+
+    sources = {}
+    for f in week:
+        if f["source"] != "CISA KEV":
+            sources.setdefault(f["source"], set()).add(f.get("cve") or f["link"])
+    top_sources = sorted(sources.items(), key=lambda kv: (-len(kv[1]), kv[0]))[:3]
+    if top_sources:
+        lines += ["", "📰 <b>Most productive sources</b>"]
+        lines.append(" · ".join(f"{esc(name)} ({len(items)})" for name, items in top_sources))
+
+    state["weekly_prev"] = totals
+    return ["\n".join(lines)]
+
+
+def weekly_due(state):
+    if os.environ.get("FORCE_WEEKLY", "").strip().lower() in {"1", "true", "yes"}:
+        return True
+    now_ist = now_utc().astimezone(IST)
+    if now_ist.weekday() != WEEKLY_DAY_IST:
+        return False
+    hour, minute = (int(x) for x in WEEKLY_TIME_IST.split(":"))
+    if (now_ist.hour, now_ist.minute) < (hour, minute):
+        return False
+    return state.get("last_weekly") != now_ist.date().isoformat()
+
+
 def digest_due(state):
     if os.environ.get("FORCE_DIGEST", "").strip().lower() in {"1", "true", "yes"}:
         return True
@@ -1244,10 +1534,12 @@ def digest_due(state):
 # Telegram
 # ---------------------------------------------------------------------------
 
-def send_telegram(token, chat_id, text, buttons=None):
+def send_telegram(token, chat_id, text, buttons=None, silent=False):
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     fields = {"chat_id": chat_id, "text": text[:4096], "parse_mode": "HTML",
               "disable_web_page_preview": "true"}
+    if silent:  # delivered without a notification sound
+        fields["disable_notification"] = "true"
     if buttons:  # one row of tap-able link buttons under the message
         fields["reply_markup"] = json.dumps(
             {"inline_keyboard": [[{"text": label, "url": u} for label, u in buttons]]})
@@ -1290,6 +1582,7 @@ def main():
         log("DRY-RUN: Telegram settings not found, messages will be printed only")
 
     config = json.loads(SOURCES_FILE.read_text(encoding="utf-8"))
+    configure_products(config)
     state = load_state()
     brand_new = not state
     state.setdefault("findings", [])
@@ -1343,6 +1636,10 @@ def main():
         state["last_digest"] = now_utc().astimezone(IST).date().isoformat()
         state["last_digest_time"] = now_utc().isoformat(timespec="seconds")
 
+    if not brand_new and weekly_due(state):
+        messages += build_weekly(state, kev)
+        state["last_weekly"] = now_utc().astimezone(IST).date().isoformat()
+
     # Delivery. Every message goes through the outbox, which is saved before sending and after each
     # message, so a run that is cut short neither loses alerts nor sends them twice. A CVE only counts
     # as "alerted" once Telegram has accepted the message; failed messages are retried next run.
@@ -1372,7 +1669,7 @@ def main():
                 print("   " + "  ".join(f"[ {label} ]" for label, _ in m["buttons"]))
             ok = True
         else:
-            ok = send_telegram(token, chat_id, m["text"], m.get("buttons"))
+            ok = send_telegram(token, chat_id, m["text"], m.get("buttons"), m.get("silent", False))
         if ok:
             sent += 1
             for key, when in m.get("keys", []):  # save_state() rebuilds this dict, so look it up each time
