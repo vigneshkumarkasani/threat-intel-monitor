@@ -128,5 +128,10 @@
   "malware_news": {
     "_note": "Malware articles that name no CVE. Set alerts to true to get them as instant alerts and in the daily digest. They are still recorded either way, so the dashboard's malware families are unaffected.",
     "alerts": false
+  },
+  "alerts": {
+    "_note": "new_cve_instant decides which plain new CVEs (no sign of exploitation yet) send an instant alert: 'watchlist_critical' = only watchlist products with CVSS >= critical_cvss, 'all' = every one, 'none' = never. The rest always appear in the daily digest. Exploited, malware, KEV and public-exploit alerts are never affected.",
+    "new_cve_instant": "watchlist_critical",
+    "critical_cvss": 9.0
   }
 }

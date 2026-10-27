@@ -27,16 +27,30 @@ Feeds are listed in `sources.json`. To add one, copy a line and change the name,
 
 | Alert | Style | Meaning |
 |---|---|---|
-| 🔴 New in CISA KEV | Detailed | CISA confirms exploitation; shows product, due date, required action, ransomware use |
-| 🦠 Malware linked to CVE | Detailed | A CVE mentioned alongside malware or a named family (Qilin, XMRig, Cobalt Strike…) |
-| 🛑 Vendor / government confirms exploitation | Detailed | An official advisory says it is exploited |
-| ⚠️ Exploitation reported | Detailed | News, research or social posts report in-the-wild exploitation |
-| 🧬 Malware activity, no CVE | Threat profile | Family, type (ransomware, infostealer, botnet…), delivery method (phishing, ClickFix, malicious packages…) |
-| 🆕 New CVE | Card | First time a CVE appears in any source |
+| 🔴 New in CISA KEV | Compact, fresh message | CISA confirms exploitation; shows product, due date, required action, ransomware use |
+| 🦠 Malware linked to CVE | Compact, edits the CVE's message | A CVE mentioned alongside malware or a named family (Qilin, XMRig, Cobalt Strike…) |
+| 🛑 Vendor / government confirms exploitation | Compact, edits the CVE's message | An official advisory says it is exploited |
+| ⚠️ Exploitation reported | Compact | News, research or social posts report in-the-wild exploitation |
+| 🧬 Malware activity, no CVE | Threat profile | Family, type (ransomware, infostealer, botnet…), delivery method (phishing, ClickFix, malicious packages…). **Off by default**: set `malware_news.alerts` to `true` in `sources.json` to get these alerts and the digest section |
+| 🆕 New CVE | Compact (watchlist and critical only; otherwise digest) | First time a CVE appears in any source |
 
-Every CVE alert includes CVSS with severity, EPSS, KEV status, a short summary, the time in IST and buttons to the article and NVD.
+### Message style
+
+- **Compact cards.** Every CVE alert is about four lines: the icon, CVE id and product; what happened plus CVSS, EPSS and KEV facts; a one-sentence summary; and the source with a count of other sources. Buttons open the article, NVD and the KEV catalog. A `👀` in front means a watchlist product.
+- **One message per CVE, edited in place.** The first urgent alert for a CVE is sent once. When the story escalates (exploited, then malware, then a public exploit), the bot quietly **edits that same message** and adds a line to a timeline at the bottom. No new notification, no repeat. When the CVE is added to **CISA KEV**, you get a **fresh message with a sound**, carrying the whole timeline. Messages are edited for 14 days (`THREAD_DAYS`); if you delete one, the next update arrives as a new message.
+- **Plain new CVEs wait for the digest.** A CVE with no sign of exploitation yet only gets an instant alert if it is a **watchlist product with CVSS 9.0 or higher**. Everything else is in the daily digest. Change this with `alerts.new_cve_instant` in `sources.json`: `watchlist_critical` (default), `all`, or `none`; `alerts.critical_cvss` sets the cut-off. Exploited, malware, KEV and public-exploit alerts are never affected.
+- **One-line digest.** Each CVE is one line (id, vendor, CVSS, KEV or malware or exploited, EPSS, source count, and a ↗ link to the first source). Vendors with several CVEs get one heading and at most six lines.
 
 A CVE is alerted again only when its news gets more serious: new CVE, then exploited, then malware, then KEV. When ten sites copy one story, you get one alert. Social media alerts only on exploitation or malware, because bots there announce every CVE.
+
+## Watchlist, vendor grouping and quiet mode
+
+All three are controlled from `sources.json`.
+
+- **Watchlist** (`watchlist.terms`): when a CVE's headline, summary, NVD description or KEV entry mentions one of these products, its alert starts with `👀 WATCHLIST: <term>` and the CVE gets its own first section in the daily digest. Matching ignores case and needs whole words. You can add more terms without editing the file through the optional `WATCHLIST` secret (comma separated). That keeps them out of a public repo.
+- **Vendor grouping** (`grouping.min_alerts_per_vendor`, default 3): when one run brings that many plain new-CVE alerts for the same vendor (not exploited, no malware, not KEV), they are sent as one `NEW CVEs · <vendor>` message, watchlist or not. In the digest, a vendor with that many CVEs gets one heading and one short line per CVE (the first 6, then a count). The watchlist tag names each vendor once, never every product. Set it to `0` to turn grouping off. Vendors are recognised from the `vendors` list (the vendor name or any of its products).
+- **Quiet mode** (`watchlist.mute_other_new_cves`): when `true`, plain new-CVE cards from outside your watchlist arrive without a notification sound. Exploited, malware, KEV and watchlist alerts always make a sound.
+- **🆕 not in NVD yet**: shown instead of the CVSS score when NVD has no record of the CVE yet, which usually means it is brand new.
 
 ## Accuracy rules
 
@@ -62,6 +76,7 @@ Optional secrets:
 | Secret | Turns on | Cost |
 |---|---|---|
 | `NVD_API_KEY` | Faster CVSS lookups ([request one](https://nvd.nist.gov/developers/request-an-api-key)) | Free |
+| `WATCHLIST` | Extra watchlist terms on top of `sources.json`, e.g. `Fortinet,Ivanti` | Free |
 | `BLUESKY_HANDLE` + `BLUESKY_APP_PASSWORD` | Bluesky search every 15 minutes | Free |
 | `X_BEARER_TOKEN` | X/Twitter search for CVE posts about exploitation or malware | About $0.005 per post read; capped by `max_reads_per_day` in `sources.json` |
 
