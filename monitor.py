@@ -183,6 +183,69 @@ def parse_time(value):
 
 
 # ---------------------------------------------------------------------------
+# Watchlist, vendors and grouping (settings come from sources.json via configure())
+# ---------------------------------------------------------------------------
+
+SETTINGS = {
+    "watch": [],         # [(term, regex)] products you care most about
+    "vendors": [],       # [(vendor name, regex of its name and products)]
+    "mute_other": False, # plain new-CVE cards arrive without a notification sound
+    "min_group": 3,      # this many plain new-CVE alerts for one vendor become one message (0 = off)
+    "malware_news": True,  # alert on (and digest) malware articles that name no CVE
+}
+
+
+def _term_regex(terms):
+    """Case-insensitive match of any term as a whole word (so 'AMD' doesn't match 'SAMDS')."""
+    alt = "|".join(re.escape(t) for t in sorted(terms, key=len, reverse=True))
+    return re.compile(r"(?<![A-Za-z0-9])(?:" + alt + r")(?![A-Za-z0-9])", re.IGNORECASE)
+
+
+def configure(config):
+    """Read the watchlist, vendor list and grouping settings from sources.json."""
+    terms = list(config.get("watchlist", {}).get("terms", []))
+    terms += [t.strip() for t in os.environ.get("WATCHLIST", "").split(",") if t.strip()]
+    SETTINGS["watch"] = [(t, _term_regex([t])) for t in dict.fromkeys(terms)]
+    SETTINGS["vendors"] = [
+        (name, _term_regex([name] + list(products)))
+        for name, products in config.get("vendors", {}).items()
+        if not name.startswith("_") and isinstance(products, list)]
+    SETTINGS["mute_other"] = bool(config.get("watchlist", {}).get("mute_other_new_cves", False))
+    SETTINGS["min_group"] = int(config.get("grouping", {}).get("min_alerts_per_vendor", 3) or 0)
+    SETTINGS["malware_news"] = bool(config.get("malware_news", {}).get("alerts", True))
+
+
+def watch_hits(text):
+    """Watchlist terms mentioned in the text."""
+    return [term for term, rx in SETTINGS["watch"] if rx.search(text or "")]
+
+
+def detect_vendor(*texts):
+    """Vendor named in the first text that names one. Within a text, the earliest mention wins."""
+    for text in texts:
+        best = None
+        for name, rx in SETTINGS["vendors"]:
+            m = rx.search(text or "")
+            if m and (best is None or m.start() < best[0]):
+                best = (m.start(), name)
+        if best:
+            return best[1]
+    return ""
+
+
+def vendor_and_watch(group, info, kev):
+    """(vendor, watchlist hits) for findings that are about the same CVE(s)."""
+    cves = {f["cve"] for f in group if f.get("cve")}
+    kev_text = " ".join(f"{kev[c].get('vendorProject', '')} {kev[c].get('product', '')} "
+                        f"{kev[c].get('vulnerabilityName', '')}" for c in cves if c in kev)
+    titles = " ".join(f.get("title", "") for f in group)
+    descs = " ".join(info.get(c, {}).get("description", "") for c in cves)
+    summaries = " ".join(f.get("summary", "") for f in group)
+    vendor = detect_vendor(kev_text, titles, descs, summaries)
+    return vendor, watch_hits(f"{kev_text} {titles} {descs} {summaries}")
+
+
+# ---------------------------------------------------------------------------
 # Saved state (seen.json)
 # ---------------------------------------------------------------------------
 
@@ -827,6 +890,7 @@ def nvd_lookup(state, cve, api_key):
         data = json.loads(fetch(url, timeout=12, headers=headers))
         NVD_LIMIT["fails"] = 0
         vulns = data.get("vulnerabilities", [])
+        info["found"] = bool(vulns)  # False = NVD has no record of this CVE yet
         if vulns:
             c = vulns[0]["cve"]
             metrics = c.get("metrics", {})
@@ -891,6 +955,8 @@ def score_line(cve, info, epss, kev):
     bits = []
     if info.get("cvss") is not None:
         bits.append(f"CVSS {info['cvss']} ({severity_of(info['cvss'], info.get('severity'))})")
+    elif info.get("found") is False:
+        bits.append("🆕 not in NVD yet")
     else:
         bits.append("CVSS not published yet")
     bits.append(f"EPSS {epss[cve] * 100:.1f}%" if cve in epss else "EPSS n/a")
@@ -934,7 +1000,8 @@ def instant_alerts(state, kev, run_id, api_key=""):
         by_article.setdefault(f["link"], []).append(f)
     for link, group in by_article.items():
         if group[0]["kind"] == "malware_news":
-            planned.append(("malware_news", group[:1], []))
+            if SETTINGS["malware_news"]:  # switched off in sources.json -> CVE alerts only
+                planned.append(("malware_news", group[:1], []))
             continue
         new, keys = [], []
         for f in group:
@@ -958,20 +1025,53 @@ def instant_alerts(state, kev, run_id, api_key=""):
                 f["cvss"] = info.get(f["cve"], {}).get("cvss")
                 f["epss"] = epss.get(f["cve"])
 
-    # --- 3) write the messages ------------------------------------------------------
-    messages = []
+    # --- 3) tag watchlist hits, then merge plain new-CVE cards from one vendor ----------
+    entries = []
     for kind, group, keys in planned:
+        vendor, hits = ("", []) if kind == "malware_news" else vendor_and_watch(group, info, kev)
+        plain = (kind == "article"
+                 and max(KIND_RANK[f["kind"]] for f in group) == KIND_RANK["cve"])
+        entries.append({"kind": kind, "group": group, "keys": keys,
+                        "vendor": vendor, "watch": hits, "plain": plain})
+    min_group = SETTINGS["min_group"]
+    if min_group:
+        by_vendor = {}
+        for e in entries:
+            if e["plain"] and not e["watch"] and e["vendor"]:
+                by_vendor.setdefault(e["vendor"], []).append(e)
+        merged = []
+        for vendor, members in by_vendor.items():
+            if len({f["cve"] for e in members for f in e["group"]}) >= min_group:
+                merged.append({"kind": "group", "vendor": vendor, "watch": [], "plain": True,
+                               "group": [f for e in members for f in e["group"]],
+                               "keys": [k for e in members for k in e["keys"]],
+                               "members": {id(e) for e in members}})
+        for m in merged:
+            first = next(i for i, e in enumerate(entries) if id(e) in m["members"])
+            entries = [e for e in entries if id(e) not in m["members"]]
+            entries.insert(first, m)
+
+    # --- 4) write the messages ------------------------------------------------------
+    messages = []
+    for e in entries:
+        kind, group, keys = e["kind"], e["group"], e["keys"]
         if kind == "kev":
             msg = render_kev(group[0], kev, info, epss)
         elif kind == "malware_news":
             msg = render_malware_news(group[0])
         elif kind == "poc":
             msg = render_poc(group, kev, info, epss)
+        elif kind == "group":
+            msg = render_group(e["vendor"], group, kev, info, epss)
         else:
             top = max(KIND_RANK[f["kind"]] for f in group)
             msg = (render_card(group, kev, info, epss) if top == KIND_RANK["cve"]
                    else render_detailed(group, top, kev, info, epss))
         msg = dict(msg) if isinstance(msg, dict) else {"text": msg}
+        if e["watch"]:
+            msg["text"] = f"👀 <b>WATCHLIST: {esc(', '.join(e['watch'][:4]))}</b>\n" + msg["text"]
+        elif e["plain"] and SETTINGS["mute_other"]:
+            msg["silent"] = True  # plain new CVE outside your watchlist: no notification sound
         msg["keys"] = [list(k) for k in keys]
         messages.append(msg)
     return messages
@@ -1009,6 +1109,34 @@ def render_card(group, kev, info, epss):
         short = short if len(short) <= 220 else short[:217].rsplit(" ", 1)[0] + "…"
         lines += ["", f"<i>{esc(short)}</i>"]
     return {"text": "\n".join(lines), "buttons": article_buttons(first["link"], cves, kev, first["source_type"])}
+
+
+def render_group(vendor, findings, kev, info, epss):
+    """One message for several plain new CVEs from the same vendor."""
+    by_cve = {}
+    for f in findings:
+        by_cve.setdefault(f["cve"], f)
+    worst = max((info.get(c, {}).get("cvss") for c in by_cve if info.get(c, {}).get("cvss") is not None),
+                default=None)
+    sev = severity_of(worst)
+    head = f"🆕 <b>NEW CVEs · {esc(vendor)}</b> ({len(by_cve)})"
+    if sev:
+        head += f" · {SEVERITY_ICON.get(sev, '')} <b>{sev.upper()}</b>"
+    lines = [head, DIVIDER]
+    for cve, f in list(by_cve.items())[:10]:
+        lines.append(f"• <code>{cve}</code>  {esc(score_line(cve, info.get(cve, {}), epss, kev))}")
+        title = f["title"] if len(f["title"]) <= 110 else f["title"][:107].rsplit(" ", 1)[0] + "…"
+        lines.append(f"   <i>{esc(title)}</i> · {esc(f['source'])}")
+    if len(by_cve) > 10:
+        lines.append(f"…and {len(by_cve) - 10} more CVEs")
+    lines += ["", f"🕒 {found_time(findings[0])}"]
+    buttons, seen_links = [], set()
+    for f in findings:
+        if f["link"].startswith("http") and f["link"] not in seen_links and len(buttons) < 3:
+            seen_links.add(f["link"])
+            buttons.append((f"📖 {f['source'][:18]}", f["link"]))
+    buttons.append(("🔎 NVD", nvd_link(next(iter(by_cve)))))
+    return {"text": "\n".join(lines), "buttons": buttons}
 
 
 def render_detailed(group, top, kev, info, epss):
@@ -1129,6 +1257,8 @@ def build_digest(state, kev, since, api_key):
     recent = [f for f in state.get("findings", []) if (parse_time(f["time"]) or since) >= since]
     news_only = [f for f in recent if f["kind"] == "malware_news"]
     recent = [f for f in recent if f["kind"] != "malware_news"]
+    if not SETTINGS["malware_news"]:  # switched off in sources.json -> CVE items only
+        news_only = []
     if not recent and not news_only:
         return [f"📋 <b>Daily threat digest · {now_utc().astimezone(IST):%d %b %Y}</b>\n"
                 "Nothing new in the last 24 hours across all sources."]
@@ -1136,7 +1266,8 @@ def build_digest(state, kev, since, api_key):
     by_cve = {}
     for f in recent:
         c = by_cve.setdefault(f["cve"], {"kinds": set(), "sources": {}, "malware": set(),
-                                         "confirmed": False, "ransomware": False})
+                                         "confirmed": False, "ransomware": False, "findings": []})
+        c["findings"].append(f)
         c["kinds"].add(f["kind"])
         c["sources"].setdefault(f["source"], f["link"])
         c["malware"] |= set(f.get("malware", []))
@@ -1148,24 +1279,30 @@ def build_digest(state, kev, since, api_key):
         c["in_kev"] = cve in kev
         if c["in_kev"] and kev[cve].get("knownRansomwareCampaignUse", "").lower() == "known":
             c["ransomware"] = True
+        c["vendor"], c["watch"] = vendor_and_watch(c["findings"], {}, kev)
 
     epss = epss_lookup(sorted(by_cve)) if by_cve else {}
 
     def rank(item):
         cve, c = item
-        return (c["in_kev"], c["confirmed"], "poc" in c["kinds"], len(c["sources"]), epss.get(cve, 0))
+        return (bool(c["watch"]), c["in_kev"], c["confirmed"], "poc" in c["kinds"],
+                len(c["sources"]), epss.get(cve, 0))
 
     ordered = sorted(by_cve.items(), key=rank, reverse=True)
     for cve, _ in ordered[:MAX_DIGEST_LOOKUPS]:
-        by_cve[cve]["nvd"] = nvd_lookup(state, cve, api_key)
+        c = by_cve[cve]
+        c["nvd"] = nvd_lookup(state, cve, api_key)
+        c["vendor"], c["watch"] = vendor_and_watch(c["findings"], {cve: c["nvd"]}, kev)  # now with NVD text
 
     def describe(cve, c):
         nvd = c.get("nvd") or {}
         k = kev.get(cve, {})
-        product = f"{k.get('vendorProject', '')} {k.get('product', '')}".strip()
+        product = f"{k.get('vendorProject', '')} {k.get('product', '')}".strip() or c.get("vendor", "")
         bits = []
         if nvd.get("cvss") is not None:
             bits.append(f"CVSS {nvd['cvss']}")
+        elif nvd.get("found") is False:
+            bits.append("🆕 not in NVD yet")
         if cve in epss:
             bits.append(f"EPSS {epss[cve] * 100:.1f}%")
         bits.append("in KEV" if c["in_kev"] else "not in KEV")
@@ -1190,7 +1327,10 @@ def build_digest(state, kev, since, api_key):
             line += "\n   " + esc(d if len(d) <= 160 else d[:157].rsplit(" ", 1)[0] + "…")
         return line
 
+    watch_items = [x for x in ordered if x[1]["watch"]]
+    ordered = [x for x in ordered if not x[1]["watch"]]  # watchlist items get their own section
     sections = [
+        ("👀 Your watchlist", watch_items),
         ("🔴 New in CISA KEV", [x for x in ordered if "kev" in x[1]["kinds"]]),
         ("🦠 Linked to malware", [x for x in ordered if "kev" not in x[1]["kinds"]
                                    and ("malware" in x[1]["kinds"] or x[1]["malware"])]),
@@ -1207,9 +1347,19 @@ def build_digest(state, kev, since, api_key):
               f"{len(by_cve)} CVEs and {len(news_only)} malware stories from {sources_count} sources "
               "in the last 24 hours. Most urgent first.")
     pieces = [header]
+    min_group = SETTINGS["min_group"]
     for title, items in sections:
         if items:
             pieces.append(f"\n<b>{title} ({len(items)})</b>")
+            if title.startswith("🆕") and min_group:  # plain new CVEs: one block per busy vendor
+                by_vendor = {}
+                for x in items:
+                    by_vendor.setdefault(x[1]["vendor"], []).append(x)
+                busy = {v: xs for v, xs in by_vendor.items() if v and len(xs) >= min_group}
+                for vendor, xs in sorted(busy.items(), key=lambda kv: -len(kv[1])):
+                    pieces.append(f"▸ <b>{esc(vendor)}</b> ({len(xs)})")
+                    pieces += [describe(cve, c) for cve, c in xs]
+                items = [x for x in items if x[1]["vendor"] not in busy]
             pieces += [describe(cve, c) for cve, c in items]
     if news_only:
         pieces.append(f"\n<b>📰 Malware news without a CVE ({len(news_only)})</b>")
@@ -1244,10 +1394,12 @@ def digest_due(state):
 # Telegram
 # ---------------------------------------------------------------------------
 
-def send_telegram(token, chat_id, text, buttons=None):
+def send_telegram(token, chat_id, text, buttons=None, silent=False):
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     fields = {"chat_id": chat_id, "text": text[:4096], "parse_mode": "HTML",
               "disable_web_page_preview": "true"}
+    if silent:  # delivered without a notification sound
+        fields["disable_notification"] = "true"
     if buttons:  # one row of tap-able link buttons under the message
         fields["reply_markup"] = json.dumps(
             {"inline_keyboard": [[{"text": label, "url": u} for label, u in buttons]]})
@@ -1290,6 +1442,7 @@ def main():
         log("DRY-RUN: Telegram settings not found, messages will be printed only")
 
     config = json.loads(SOURCES_FILE.read_text(encoding="utf-8"))
+    configure(config)
     state = load_state()
     brand_new = not state
     state.setdefault("findings", [])
@@ -1367,12 +1520,12 @@ def main():
     sent, failed = 0, []
     for i, m in enumerate(queue):
         if dry_run:
-            print("\n" + "-" * 60 + "\n" + m["text"])
+            print("\n" + "-" * 60 + ("  (silent)" if m.get("silent") else "") + "\n" + m["text"])
             if m.get("buttons"):
                 print("   " + "  ".join(f"[ {label} ]" for label, _ in m["buttons"]))
             ok = True
         else:
-            ok = send_telegram(token, chat_id, m["text"], m.get("buttons"))
+            ok = send_telegram(token, chat_id, m["text"], m.get("buttons"), m.get("silent", False))
         if ok:
             sent += 1
             for key, when in m.get("keys", []):  # save_state() rebuilds this dict, so look it up each time
