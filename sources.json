@@ -124,5 +124,9 @@
     "query": "CVE (exploited OR \"in the wild\" OR zero-day OR 0day OR ransomware OR malware OR botnet OR backdoor OR webshell) -is:retweet -is:reply lang:en",
     "max_reads_per_day": 150,
     "max_per_run": 20
+  },
+  "malware_news": {
+    "_note": "Malware articles that name no CVE. Set alerts to true to get them as instant alerts and in the daily digest. They are still recorded either way, so the dashboard's malware families are unaffected.",
+    "alerts": false
   }
 }
