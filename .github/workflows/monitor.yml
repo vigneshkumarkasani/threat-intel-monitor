@@ -9,10 +9,6 @@ on:
         description: "Send the daily digest now"
         type: boolean
         default: false
-      force_weekly:
-        description: "Send the weekly report now"
-        type: boolean
-        default: false
 
 permissions:
   contents: write              # lets the job save the bot's memory and the dashboard data to branches
@@ -75,7 +71,6 @@ jobs:
           X_BEARER_TOKEN: ${{ secrets.X_BEARER_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # provided by GitHub automatically, for its API
           FORCE_DIGEST: ${{ inputs.force_digest }}
-          FORCE_WEEKLY: ${{ inputs.force_weekly }}
         run: python3 monitor.py      # the runner already has Python 3; the script needs nothing else
 
       - name: Save the bot's memory
