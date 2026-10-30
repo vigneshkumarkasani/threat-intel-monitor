@@ -1,6 +1,6 @@
 # Threat Intel Monitor
 
-A personal early-warning feed for vulnerability intelligence. Every 20 minutes it checks over 40 news, research, vendor, government, exploit and social sources, plus the CISA KEV catalog. It sends a Telegram alert within minutes of publication whenever:
+A personal early-warning feed for vulnerability intelligence. Every 5 minutes it checks over 34 news, research, vendor, government, exploit and social sources, plus the CISA KEV catalog. It sends a Telegram alert within minutes of publication whenever:
 
 - a **new CVE** appears in any news, research, vendor or government source,
 - a CVE is reported **exploited**, or **linked to malware**,
