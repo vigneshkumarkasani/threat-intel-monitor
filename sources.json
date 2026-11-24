@@ -26,7 +26,7 @@
     {"name": "Cisco Advisories", "type": "vendor", "url": "https://sec.cloudapps.cisco.com/security/center/psirtrss20/CiscoSecurityAdvisory.xml"},
     {"name": "Fortinet PSIRT", "type": "vendor", "url": "https://filestore.fortinet.com/fortiguard/rss/ir.xml"},
     {"name": "Palo Alto Advisories", "type": "vendor", "url": "https://security.paloaltonetworks.com/rss.xml"},
-    {"name": "Google Chrome Releases", "type": "vendor", "url": "https://feeds.feedburner.com/GoogleChromeReleases"},
+    '''{"name": "Google Chrome Releases", "type": "vendor", "url": "https://feeds.feedburner.com/GoogleChromeReleases"},'''
     {"name": "Oracle Security Alerts", "type": "vendor", "url": "https://www.oracle.com/ocom/groups/public/@otn/documents/webcontent/rss-otn-sec.xml"},
     {"name": "Canadian Centre for Cyber Security", "type": "government", "url": "https://www.cyber.gc.ca/api/cccs/atom/v1/get?feed=alerts_advisories&lang=en"},
     {"name": "CERT-EU", "type": "government", "url": "https://cert.europa.eu/publications/security-advisories-rss"},
